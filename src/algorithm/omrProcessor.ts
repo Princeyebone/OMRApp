@@ -1,5 +1,6 @@
 import { OpenCV, ObjectType, DataTypes, ColorConversionCodes, InterpolationFlags, BorderTypes, DecompTypes, NormTypes, MorphTypes } from 'react-native-fast-opencv';
 import RNFS from 'react-native-fs';
+import { bundledMarkerBase64 } from './bundledAssets';
 
 const FIELD_TYPES: any = {
   QTYPE_INT: {
@@ -56,7 +57,10 @@ export class OMRProcessor {
       const imgBase64 = await RNFS.readFile(imagePath, 'base64');
       let imgMat = OpenCV.base64ToMat(imgBase64);
       
-      const markerBase64 = await RNFS.readFile(markerPath, 'base64');
+      let markerBase64 = markerPath === "BUNDLED" ? bundledMarkerBase64 : "";
+      if (markerPath !== "BUNDLED") {
+        markerBase64 = await RNFS.readFile(markerPath, 'base64');
+      }
       const markerMat = OpenCV.base64ToMat(markerBase64);
 
       // Optimization: Downscale huge camera photos to prevent OpenCV freezing/timeout

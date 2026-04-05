@@ -5,6 +5,7 @@ import RNFS from 'react-native-fs';
 import { OMRProcessor } from '../../algorithm/omrProcessor';
 import { saveResult } from '../../db/database';
 import CameraScanner from '../../components/CameraScanner';
+import { bundledTemplate, bundledEvaluation } from '../../algorithm/bundledAssets';
 
 const HomeScreen = () => {
   const theme = useTheme();
@@ -38,24 +39,9 @@ const HomeScreen = () => {
   const processAndScore = async (imagePath: string, testName: string) => {
     setLoading(true);
     try {
-      const baseDir = `${RNFS.ExternalDirectoryPath}/sample1`;
-      const markerPath = `${baseDir}/omr_marker.jpg`;
-      const templatePath = `${baseDir}/template.json`;
-
-      const exists = await RNFS.exists(templatePath);
-      if (!exists) {
-        throw new Error(`Template not found at ${templatePath}. Ensure assets are pushed.`);
-      }
-
-      const templateStr = await RNFS.readFile(templatePath, 'utf8');
-      const template = JSON.parse(templateStr);
-
-      const evalPath = `${baseDir}/evaluation.json`;
-      let evaluation: any = null;
-      if (await RNFS.exists(evalPath)) {
-        const evalStr = await RNFS.readFile(evalPath, 'utf8');
-        evaluation = JSON.parse(evalStr);
-      }
+      const template = bundledTemplate;
+      const evaluation = bundledEvaluation;
+      const markerPath = "BUNDLED";
 
       console.log(`Starting OMR processing for ${testName}...`);
       const startTime = Date.now();
