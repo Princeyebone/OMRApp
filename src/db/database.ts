@@ -20,3 +20,7 @@ export const getAllResults = () => {
   const result = db.execute('SELECT * FROM results ORDER BY date DESC');
   return result.rows?._array || [];
 };
+
+export const deleteResult = (id: number) => {
+  db.execute('DELETE FROM results WHERE id = ?', [id]);
+};

@@ -49,7 +49,7 @@ export class OMRProcessor {
   static async processImage(imagePath: string, template: any, markerPath: string, onProgress?: (msg: string) => void): Promise<any> {
     const yieldFrame = async () => new Promise(resolve => setTimeout(() => resolve(true), 10));
     try {
-      if (onProgress) onProgress("Loading high-res image...");
+      if (onProgress) onProgress("Loading...");
       await yieldFrame();
       
       // 1. Load Image and Marker from file to base64 to Mat
@@ -63,7 +63,7 @@ export class OMRProcessor {
       const info = OpenCV.toJSValue(imgMat) as any;
       const maxDim = Math.max(info.cols, info.rows);
       if (maxDim > 1240) {
-        if (onProgress) onProgress("Optimizing image resolution...");
+        if (onProgress) onProgress("Optimizing...");
         await yieldFrame();
         const scale = 1240 / maxDim;
         const newCols = Math.floor(info.cols * scale);
@@ -79,19 +79,19 @@ export class OMRProcessor {
       const grayMarkerMat = this.ensureGrayscale(markerMat);
 
       // 3. Detect Markers (Match Template in 4 corners)
-      if (onProgress) onProgress("Scanning for structural anchors...");
+      if (onProgress) onProgress("Detecting Markers...");
       await yieldFrame();
       const corners = await this.detectMarkers(grayMat, grayMarkerMat);
       if (!corners) throw new Error('Could not detect 4 markers');
 
       // 4. Warp Sheet to Top-Down View
-      if (onProgress) onProgress("Aligning and flattening document view...");
+      if (onProgress) onProgress("Aligning Sheet...");
       await yieldFrame();
       const warpedMat = await this.warpSheet(imgMat, corners, template);
       const warpedGrayMat = this.ensureGrayscale(warpedMat);
 
       // 5. Detect Bubbles based on Template ROIs
-      if (onProgress) onProgress("Evaluating optical bubbles...");
+      if (onProgress) onProgress("Extracting Bubbles...");
       await yieldFrame();
       const results = await this.detectBubbles(warpedGrayMat, template);
 

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { StyleSheet, View, LogBox, Text, Animated } from 'react-native';
+import { StyleSheet, View, LogBox, Text, Animated, BackHandler } from 'react-native';
 import { Provider as PaperProvider, MD3DarkTheme, BottomNavigation } from 'react-native-paper';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { initDatabase } from './src/db/database';
@@ -61,6 +61,18 @@ const App = () => {
     scanner: HomeScreen,
     history: HistoryScreen,
   });
+
+  useEffect(() => {
+    const onHardwareBack = () => {
+      if (index === 1) {
+        setIndex(0);
+        return true; 
+      }
+      return false;
+    };
+    const sub = BackHandler.addEventListener('hardwareBackPress', onHardwareBack);
+    return () => sub.remove();
+  }, [index]);
 
   useEffect(() => {
     try {

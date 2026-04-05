@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, ScrollView, RefreshControl } from 'react-native';
-import { Text, Card, Avatar, useTheme } from 'react-native-paper';
-import { getAllResults } from '../../db/database';
+import { StyleSheet, View, ScrollView, RefreshControl, Alert } from 'react-native';
+import { Text, Card, Avatar, useTheme, IconButton } from 'react-native-paper';
+import { getAllResults, deleteResult } from '../../db/database';
 
 const HistoryScreen = () => {
   const theme = useTheme();
@@ -26,6 +26,24 @@ const HistoryScreen = () => {
     loadHistory();
     setRefreshing(false);
   }, []);
+
+  const handleDelete = (id: number) => {
+    Alert.alert(
+      "Delete Record",
+      "Are you sure you want to permanently delete this scan result?",
+      [
+        { text: "Cancel", style: "cancel" },
+        { 
+          text: "Delete", 
+          style: "destructive", 
+          onPress: () => {
+            deleteResult(id);
+            loadHistory();
+          } 
+        }
+      ]
+    );
+  };
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
@@ -55,9 +73,17 @@ const HistoryScreen = () => {
                   subtitle={`Scanned on ${dateStr}`}
                   left={(props) => <Avatar.Icon {...props} icon="account-circle" style={{ backgroundColor: theme.colors.primaryContainer }} color={theme.colors.onPrimaryContainer} />}
                   right={(props) => (
-                    <View style={styles.scoreContainer}>
-                      <Text variant="titleLarge" style={[styles.scoreText, { color: theme.colors.primary }]}>{item.score}</Text>
-                      <Text variant="labelSmall" style={{ color: theme.colors.outline }}>PTS</Text>
+                    <View style={styles.rightOverlay}>
+                      <View style={styles.scoreContainer}>
+                        <Text variant="titleLarge" style={[styles.scoreText, { color: theme.colors.primary }]}>{item.score}</Text>
+                        <Text variant="labelSmall" style={{ color: theme.colors.outline }}>PTS</Text>
+                      </View>
+                      <IconButton 
+                        icon="trash-can-outline" 
+                        iconColor={theme.colors.error} 
+                        size={24} 
+                        onPress={() => handleDelete(item.id)} 
+                      />
                     </View>
                   )}
                 />
@@ -92,8 +118,13 @@ const styles = StyleSheet.create({
     borderRadius: 16,
   },
   scoreContainer: {
-    paddingRight: 20,
     alignItems: 'center',
+    marginRight: 8,
+  },
+  rightOverlay: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingRight: 8,
   },
   scoreText: {
     fontWeight: 'bold',
