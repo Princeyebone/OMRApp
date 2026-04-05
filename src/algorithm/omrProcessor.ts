@@ -1,4 +1,4 @@
-import { OpenCV, ObjectType, DataTypes, ColorConversionCodes, InterpolationFlags, BorderTypes, DecompTypes } from 'react-native-fast-opencv';
+import { OpenCV, ObjectType, DataTypes, ColorConversionCodes, InterpolationFlags, BorderTypes, DecompTypes, NormTypes, MorphTypes } from 'react-native-fast-opencv';
 import RNFS from 'react-native-fs';
 
 const FIELD_TYPES: any = {
@@ -82,14 +82,12 @@ export class OMRProcessor {
 
   private static async detectMarkers(image: any, marker: any): Promise<number[][] | null> {
     const imgInfo = OpenCV.toJSValue(image);
-    const markerInfo = OpenCV.toJSValue(marker);
+    const originalMarkerInfo = OpenCV.toJSValue(marker);
     
-    console.log(`Image: ${imgInfo.cols}x${imgInfo.rows}, Channels: ${(imgInfo.type >> 3) + 1}`);
-    console.log(`Marker: ${markerInfo.cols}x${markerInfo.rows}, Channels: ${(markerInfo.type >> 3) + 1}`);
-    
+    // Use target width for marker detection (approx 1/17th of sheet width)
+    const baseTargetWidth = Math.floor(imgInfo.cols / 17);
     const h = imgInfo.rows;
     const w = imgInfo.cols;
-    
     const midH = h / 2;
     const midW = w / 2;
 
@@ -101,38 +99,58 @@ export class OMRProcessor {
     ];
 
     const centers: number[][] = [];
+    console.log(`Detecting markers in 4 quadrants...`);
 
-    console.log(`Detecting markers in ${quadrants.length} quadrants...`);
     for (const quad of quadrants) {
-      console.log(`Checking quadrant: x=${quad.x}, y=${quad.y}, w=${quad.w}, h=${quad.h}`);
       try {
         const rect = OpenCV.createObject(ObjectType.Rect, quad.x, quad.y, quad.w, quad.h);
         const quadMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
         OpenCV.invoke('crop', image, quadMat, rect);
-        
+
+        let bestScore = 0;
+        let bestCenter = [0, 0];
+        let bestSw = 0;
+
         const resMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_32F);
-        const maskMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+        const emptyMask = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+        const resizedMarker = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+
+        // Search scales from 30% to 150% of the expected marker width
+        const minSw = Math.max(10, Math.floor(baseTargetWidth * 0.3));
+        const maxSw = Math.floor(baseTargetWidth * 1.5);
+
+        for (let sw = minSw; sw <= maxSw; sw += 3) {
+          const sh = Math.floor(sw * (originalMarkerInfo.rows / originalMarkerInfo.cols));
+          const markerSize = OpenCV.createObject(ObjectType.Size, sw, sh);
+
+          OpenCV.invoke('resize', marker, resizedMarker, markerSize, 0, 0, InterpolationFlags.INTER_LINEAR);
+          OpenCV.invoke('matchTemplate', quadMat, resizedMarker, resMat, 5, emptyMask); 
+          const minMax = OpenCV.invoke('minMaxLoc', resMat);
+
+          if (minMax.maxVal > bestScore) {
+            bestScore = minMax.maxVal;
+            bestSw = sw;
+            bestCenter = [
+              minMax.maxX + quad.x + sw / 2,
+              minMax.maxY + quad.y + sh / 2
+            ];
+          }
+        }
+
+        console.log(`Quadrant [${quad.x},${quad.y}] Best Match: ${bestScore.toFixed(4)} at (${bestCenter[0]}, ${bestCenter[1]}) with marker width ${bestSw}`);
         
-        OpenCV.invoke('matchTemplate', quadMat, marker, resMat, 5, maskMat); 
-        const minMax = OpenCV.invoke('minMaxLoc', resMat);
-        
-        console.log(`Quadrant [${quad.x},${quad.y}] Best Match Value: ${minMax.maxVal.toFixed(4)}`);
-        
-        if (minMax.maxVal > 0.15) { // Lowered threshold to 0.15 for better robustness
-          console.log(`Marker found! Score: ${minMax.maxVal.toFixed(4)}`);
-          centers.push([
-            minMax.maxX + quad.x + markerInfo.cols / 2,
-            minMax.maxY + quad.y + markerInfo.rows / 2
-          ]);
+        if (bestScore > 0.55) { // Strict threshold prevents picking up random noise
+          centers.push(bestCenter);
+        } else {
+          console.warn(`Quadrant [${quad.x},${quad.y}] failed with low score: ${bestScore.toFixed(4)}`);
         }
       } catch (e: any) {
         console.error(`Error in quadrant ${quad.x},${quad.y}:`, e.message);
-        throw e;
       }
     }
 
     if (centers.length < 4) {
-      console.warn(`Only found ${centers.length} markers. Minimum 4 required for full perspective warp.`);
+      console.warn(`Only found ${centers.length} markers. OMR extraction may fail.`);
     }
 
     return centers.length === 4 ? centers : null;
@@ -167,7 +185,7 @@ export class OMRProcessor {
     console.log(`Executing warpPerspective with size: ${targetW}x${targetH}`);
     const borderValue = OpenCV.createObject(ObjectType.Scalar, 0, 0, 0, 0);
     OpenCV.invoke('warpPerspective', image, warped, M, size, InterpolationFlags.INTER_LINEAR, BorderTypes.BORDER_CONSTANT, borderValue);
-    
+
     return warped;
   }
 
@@ -223,15 +241,59 @@ export class OMRProcessor {
       }
     }
 
-    const intensitiesOnly = allIntensities.map(i => i.intensity).sort((a, b) => a - b);
-    const threshold = (intensitiesOnly[0] + intensitiesOnly[intensitiesOnly.length - 1]) / 2;
+    const globalThreshold = this.getGlobalThreshold(allIntensities.map(i => i.intensity));
+    console.log(`Global Threshold: ${globalThreshold.toFixed(2)}`);
 
+    const rawResponses: any = {};
     allIntensities.forEach(i => {
-      if (i.intensity < threshold) {
-        responses[i.label] = (responses[i.label] || '') + i.val;
+      if (i.intensity < globalThreshold) {
+        rawResponses[i.label] = (rawResponses[i.label] || '') + i.val;
+      } else if (!rawResponses[i.label]) {
+        rawResponses[i.label] = '';
       }
     });
 
-    return responses;
+    // Handle Custom Labels Concatenation (e.g. Roll)
+    const customLabels = template.customLabels || {};
+    const finalResponses: any = {};
+    const usedLabels = new Set();
+
+    for (const [customName, rawKeys] of Object.entries<string[]>(customLabels)) {
+      let combined = '';
+      rawKeys.forEach(rk => {
+        const subLabels = parseRange(rk);
+        subLabels.forEach(sl => {
+          combined += rawResponses[sl] || '';
+          usedLabels.add(sl);
+        });
+      });
+      finalResponses[customName] = combined;
+    }
+
+    // Add remaining labels
+    for (const [label, val] of Object.entries<string>(rawResponses)) {
+      if (!usedLabels.has(label)) {
+        finalResponses[label] = val;
+      }
+    }
+
+    return finalResponses;
+  }
+
+  private static getGlobalThreshold(intensities: number[]): number {
+    if (intensities.length < 2) return 128;
+    const sorted = [...intensities].sort((a, b) => a - b);
+    let maxJump = 30;
+    let threshold = (sorted[0] + sorted[sorted.length - 1]) / 2;
+    
+    // Finding the largest jump in intensities to separate marked/unmarked
+    for (let i = 1; i < sorted.length - 1; i++) {
+        const jump = sorted[i + 1] - sorted[i - 1];
+        if (jump > maxJump) {
+            maxJump = jump;
+            threshold = sorted[i - 1] + jump / 2;
+        }
+    }
+    return threshold;
   }
 }

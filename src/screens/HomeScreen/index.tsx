@@ -3,6 +3,7 @@ import { StyleSheet, View, ScrollView, Alert } from 'react-native';
 import { Text, Card, Button, Avatar, useTheme, Dialog, Portal, List } from 'react-native-paper';
 import RNFS from 'react-native-fs';
 import { OMRProcessor } from '../../algorithm/omrProcessor';
+import { saveResult } from '../../db/database';
 
 const HomeScreen = () => {
   const theme = useTheme();
@@ -27,14 +28,43 @@ const HomeScreen = () => {
       const templateStr = await RNFS.readFile(templatePath, 'utf8');
       const template = JSON.parse(templateStr);
 
+      const evalPath = `${baseDir}/evaluation.json`;
+      let evaluation: any = null;
+      if (await RNFS.exists(evalPath)) {
+        const evalStr = await RNFS.readFile(evalPath, 'utf8');
+        evaluation = JSON.parse(evalStr);
+      }
+
       console.log("Starting OMR processing...");
       const startTime = Date.now();
       const data = await OMRProcessor.processImage(imagePath, template, markerPath);
       const duration = Date.now() - startTime;
       console.log(`OMR processing finished in ${duration}ms`);
+      console.log("OMR Extracted Data:", JSON.stringify(data, null, 2));
+
+      // Simple Scoring logic (if evaluation is present)
+      let score = 0;
+      if (evaluation && evaluation.options) {
+          const correctAnswers = evaluation.options.answers_in_order;
+          // Example: q1..20
+          for (let i = 1; i <= 20; i++) {
+              const label = `q${i}`;
+              if (data[label] === correctAnswers[i-1]) {
+                  score += 4;
+              } else if (data[label] && data[label] !== '') {
+                  score -= 1;
+              }
+          }
+      }
+
+      // Save Result to SQLite
+      const studentId = data.Roll || "001";
+      saveResult(studentId, data, score);
+      console.log(`Result saved to database for Student ${studentId} with score ${score}`);
 
       setResult(data);
       setShowResult(true);
+      Alert.alert("Success", `OMR processed! Score: ${score}`);
     } catch (error: any) {
       console.error("Test execution failed:", error);
       Alert.alert("Test Failed", error.message);
