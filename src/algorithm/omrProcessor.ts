@@ -46,28 +46,53 @@ export class OMRProcessor {
   /**
    * Process an image using a given template.
    */
-  static async processImage(imagePath: string, template: any, markerPath: string): Promise<any> {
+  static async processImage(imagePath: string, template: any, markerPath: string, onProgress?: (msg: string) => void): Promise<any> {
+    const yieldFrame = async () => new Promise(resolve => setTimeout(() => resolve(true), 10));
     try {
+      if (onProgress) onProgress("Loading high-res image...");
+      await yieldFrame();
+      
       // 1. Load Image and Marker from file to base64 to Mat
       const imgBase64 = await RNFS.readFile(imagePath, 'base64');
-      const imgMat = OpenCV.base64ToMat(imgBase64);
+      let imgMat = OpenCV.base64ToMat(imgBase64);
       
       const markerBase64 = await RNFS.readFile(markerPath, 'base64');
       const markerMat = OpenCV.base64ToMat(markerBase64);
+
+      // Optimization: Downscale huge camera photos to prevent OpenCV freezing/timeout
+      const info = OpenCV.toJSValue(imgMat) as any;
+      const maxDim = Math.max(info.cols, info.rows);
+      if (maxDim > 1240) {
+        if (onProgress) onProgress("Optimizing image resolution...");
+        await yieldFrame();
+        const scale = 1240 / maxDim;
+        const newCols = Math.floor(info.cols * scale);
+        const newRows = Math.floor(info.rows * scale);
+        const resizedImg = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+        const newSize = OpenCV.createObject(ObjectType.Size, newCols, newRows);
+        OpenCV.invoke('resize', imgMat, resizedImg, newSize, 0, 0, InterpolationFlags.INTER_LINEAR);
+        imgMat = resizedImg;
+      }
 
       // 2. Ensure both are Grayscale
       const grayMat = this.ensureGrayscale(imgMat);
       const grayMarkerMat = this.ensureGrayscale(markerMat);
 
       // 3. Detect Markers (Match Template in 4 corners)
+      if (onProgress) onProgress("Scanning for structural anchors...");
+      await yieldFrame();
       const corners = await this.detectMarkers(grayMat, grayMarkerMat);
       if (!corners) throw new Error('Could not detect 4 markers');
 
       // 4. Warp Sheet to Top-Down View
+      if (onProgress) onProgress("Aligning and flattening document view...");
+      await yieldFrame();
       const warpedMat = await this.warpSheet(imgMat, corners, template);
       const warpedGrayMat = this.ensureGrayscale(warpedMat);
 
       // 5. Detect Bubbles based on Template ROIs
+      if (onProgress) onProgress("Evaluating optical bubbles...");
+      await yieldFrame();
       const results = await this.detectBubbles(warpedGrayMat, template);
 
       // 6. Cleanup Memory

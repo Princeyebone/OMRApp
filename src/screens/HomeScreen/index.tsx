@@ -1,28 +1,50 @@
-import React, { useState } from 'react';
-import { StyleSheet, View, ScrollView, Alert } from 'react-native';
-import { Text, Card, Button, Avatar, useTheme, Dialog, Portal, List } from 'react-native-paper';
+import React, { useState, useEffect } from 'react';
+import { StyleSheet, View, ScrollView, ImageBackground, BackHandler } from 'react-native';
+import { Text, Card, Button, Avatar, useTheme, Dialog, Portal, List, Surface, Snackbar } from 'react-native-paper';
 import RNFS from 'react-native-fs';
 import { OMRProcessor } from '../../algorithm/omrProcessor';
 import { saveResult } from '../../db/database';
+import CameraScanner from '../../components/CameraScanner';
 
 const HomeScreen = () => {
   const theme = useTheme();
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
+  const [scoreVal, setScoreVal] = useState<number>(0);
   const [showResult, setShowResult] = useState(false);
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [snackbarVisible, setSnackbarVisible] = useState(false);
+  const [progressText, setProgressText] = useState("");
 
-  const runTest = async () => {
+  const showError = (msg: string) => {
+    setErrorMessage(msg);
+    setSnackbarVisible(true);
+  };
+
+  useEffect(() => {
+    const onBackPress = () => {
+      if (isCameraActive) {
+        setIsCameraActive(false);
+        return true;
+      }
+      return false;
+    };
+    
+    const subscription = BackHandler.addEventListener('hardwareBackPress', onBackPress);
+    return () => subscription.remove();
+  }, [isCameraActive]);
+
+  const processAndScore = async (imagePath: string, testName: string) => {
     setLoading(true);
     try {
       const baseDir = `${RNFS.ExternalDirectoryPath}/sample1`;
-      const imagePath = `${baseDir}/sheet_image.jpg`;
       const markerPath = `${baseDir}/omr_marker.jpg`;
       const templatePath = `${baseDir}/template.json`;
 
-      // Check if files exist
-      const exists = await RNFS.exists(imagePath);
+      const exists = await RNFS.exists(templatePath);
       if (!exists) {
-        throw new Error(`Test image not found at ${imagePath}. Please ensure files are pushed to the device.`);
+        throw new Error(`Template not found at ${templatePath}. Ensure assets are pushed.`);
       }
 
       const templateStr = await RNFS.readFile(templatePath, 'utf8');
@@ -35,18 +57,17 @@ const HomeScreen = () => {
         evaluation = JSON.parse(evalStr);
       }
 
-      console.log("Starting OMR processing...");
+      console.log(`Starting OMR processing for ${testName}...`);
       const startTime = Date.now();
-      const data = await OMRProcessor.processImage(imagePath, template, markerPath);
+      const data = await OMRProcessor.processImage(imagePath, template, markerPath, (msg) => {
+        setProgressText(msg);
+      });
       const duration = Date.now() - startTime;
-      console.log(`OMR processing finished in ${duration}ms`);
-      console.log("OMR Extracted Data:", JSON.stringify(data, null, 2));
+      console.log(`OMR finished in ${duration}ms`);
 
-      // Simple Scoring logic (if evaluation is present)
       let score = 0;
       if (evaluation && evaluation.options) {
           const correctAnswers = evaluation.options.answers_in_order;
-          // Example: q1..20
           for (let i = 1; i <= 20; i++) {
               const label = `q${i}`;
               if (data[label] === correctAnswers[i-1]) {
@@ -57,126 +78,227 @@ const HomeScreen = () => {
           }
       }
 
-      // Save Result to SQLite
-      const studentId = data.Roll || "001";
+      const studentId = data.Roll || "Unknown";
       saveResult(studentId, data, score);
-      console.log(`Result saved to database for Student ${studentId} with score ${score}`);
-
+      
+      setScoreVal(score);
       setResult(data);
       setShowResult(true);
-      Alert.alert("Success", `OMR processed! Score: ${score}`);
     } catch (error: any) {
-      console.error("Test execution failed:", error);
-      Alert.alert("Test Failed", error.message);
+      console.log("[OMR Error]:", error);
+      let userMessage = "An unexpected error occurred. Please try again.";
+      if (error.message.includes('markers')) {
+         userMessage = "Could not find the page markers. Please align the sheet clearly within the frame.";
+      } else if (error.message.includes('Template')) {
+         userMessage = "Template configuration is missing. Sync assets first.";
+      }
+      showError(userMessage);
     } finally {
       setLoading(false);
+      setProgressText("");
     }
   };
 
+  const runBundledTest = async () => {
+    const defaultImagePath = `${RNFS.ExternalDirectoryPath}/sample1/sheet_image.jpg`;
+    await processAndScore(defaultImagePath, "Sample Data");
+  };
+
+  const runCameraScan = () => {
+    setIsCameraActive(true);
+  };
+
+  const handleCameraCapture = async (photoUri: string) => {
+    setIsCameraActive(false);
+    await processAndScore(photoUri.replace('file://', ''), "Camera Capture");
+  };
+
+  if (isCameraActive) {
+    return (
+      <CameraScanner 
+        onCapture={handleCameraCapture} 
+        onCancel={() => setIsCameraActive(false)} 
+      />
+    );
+  }
+
   return (
-    <View style={{ flex: 1 }}>
-      <ScrollView style={[styles.container, { backgroundColor: theme.colors.background }]}>
+    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
+      <ScrollView contentContainerStyle={styles.scrollContainer} showsVerticalScrollIndicator={false}>
+        
         <View style={styles.header}>
-          <Text variant="headlineLarge" style={styles.title}>OMR Offline</Text>
-          <Text variant="bodyMedium" style={{ color: theme.colors.outline }}>Precision Scanner & Processor</Text>
+          <Text variant="displaySmall" style={[styles.title, { color: theme.colors.primary }]}>OmrVision</Text>
+          <Text variant="titleMedium" style={{ color: theme.colors.outline, marginTop: 4 }}>Fast, Offline Precision Grading</Text>
         </View>
 
-        <View style={styles.content}>
-          <Card style={styles.card} mode="elevated">
-            <Card.Title 
-              title="Process Sample 1" 
-              subtitle="Test with bundled data"
-              left={(props) => <Avatar.Icon {...props} icon="folder-check" />}
-            />
-            <Card.Content>
-              <Text variant="bodyMedium">Check the accuracy of the ported algorithm using data from sample1 directory.</Text>
-            </Card.Content>
-            <Card.Actions>
-              <Button 
-                mode="contained" 
-                onPress={runTest} 
-                loading={loading} 
-                disabled={loading}
-              >
-                RUN TEST
-              </Button>
-            </Card.Actions>
-          </Card>
+        <Surface style={styles.heroSurface} elevation={2}>
+          <View style={styles.heroContent}>
+            <Avatar.Icon size={72} icon="line-scan" style={{ backgroundColor: theme.colors.primaryContainer, marginBottom: 16 }} color={theme.colors.onPrimaryContainer} />
+            <Text variant="headlineSmall" style={{ fontWeight: 'bold', marginBottom: 8, textAlign: 'center' }}>Capture a Sheet</Text>
+            <Text variant="bodyMedium" style={{ textAlign: 'center', color: theme.colors.onSurfaceVariant, marginBottom: 24, paddingHorizontal: 10 }}>
+              Align the four corner markers perfectly inside the frame to instantly grade multiple choice assessments using your camera.
+            </Text>
+            <Button 
+              mode="contained" 
+              icon="camera" 
+              onPress={runCameraScan} 
+              loading={loading}
+              disabled={loading}
+              contentStyle={styles.mainButtonContent}
+              labelStyle={styles.mainButtonLabel}
+              style={styles.mainButton}
+            >
+              {loading && progressText ? progressText.toUpperCase() : "SCAN NOW"}
+            </Button>
+          </View>
+        </Surface>
 
-          <Card style={styles.card} mode="elevated">
-            <Card.Title 
-              title="Scan New Sheet" 
-              subtitle="Offline Processing"
-              left={(props) => <Avatar.Icon {...props} icon="camera" />}
-            />
-            <Card.Content>
-              <Text variant="bodyMedium">Take a photo of a new OMR sheet to process it in real-time without internet.</Text>
-            </Card.Content>
-            <Card.Actions>
-              <Button mode="outlined" onPress={() => console.log("Camera pressed")}>OPEN CAMERA</Button>
-            </Card.Actions>
-          </Card>
-
-          <Card style={styles.card} mode="elevated">
-            <Card.Title 
-              title="Scan History" 
-              subtitle="Stored in SQLite"
-              left={(props) => <Avatar.Icon {...props} icon="history" />}
-            />
-            <Card.Content>
-              <Text variant="bodyMedium">View previously processed sheets, scores, and exports.</Text>
-            </Card.Content>
-            <Card.Actions>
-              <Button onPress={() => console.log("History pressed")}>VIEW ALL</Button>
-            </Card.Actions>
-          </Card>
+        <View style={styles.sectionHeader}>
+          <Text variant="titleLarge" style={{ fontWeight: '600' }}>Developer Tools</Text>
         </View>
+
+        <Card style={styles.devCard} mode="elevated" elevation={1}>
+          <Card.Title 
+            title="Run Bundled Benchmark" 
+            subtitle="Test matching pipeline on sample data"
+            left={(props) => <Avatar.Icon {...props} icon="code-braces" size={44} style={{ backgroundColor: theme.colors.secondaryContainer }} />}
+          />
+          <Card.Actions>
+            <Button mode="outlined" onPress={runBundledTest} loading={loading} disabled={loading} icon="play">
+              {loading && progressText ? progressText.toUpperCase() : "RUN BENCHMARK"}
+            </Button>
+          </Card.Actions>
+        </Card>
+
       </ScrollView>
 
       <Portal>
-        <Dialog visible={showResult} onDismiss={() => setShowResult(false)} style={{ maxHeight: '80%' }}>
-          <Dialog.Title>Test Result</Dialog.Title>
-          <Dialog.ScrollArea>
+        <Dialog visible={showResult} onDismiss={() => setShowResult(false)} style={styles.dialog}>
+          <View style={styles.dialogHeader}>
+            <View style={[styles.scoreBubble, { backgroundColor: theme.colors.primaryContainer }]}>
+               <Text variant="displaySmall" style={{ color: theme.colors.onPrimaryContainer, fontWeight: 'bold' }}>{scoreVal}</Text>
+               <Text variant="labelSmall" style={{ color: theme.colors.onPrimaryContainer }}>SCORE</Text>
+            </View>
+            <Text variant="headlineSmall" style={{ fontWeight: 'bold', marginTop: 16 }}>Test Graded</Text>
+            <Text variant="bodyMedium" style={{ color: theme.colors.outline, marginTop: 4 }}>Student: {result?.Roll}</Text>
+          </View>
+          
+          <Dialog.ScrollArea style={styles.dialogScrollArea}>
             <ScrollView contentContainerStyle={{ paddingVertical: 10 }}>
-              {result && Object.entries(result).map(([key, value]: any) => (
-                <List.Item
-                  key={key}
-                  title={key}
-                  description={`Detected: ${value}`}
-                  left={props => <List.Icon {...props} icon="check-circle-outline" />}
-                />
-              ))}
+              {result && Object.keys(result)
+                .filter(key => key !== 'Roll')
+                .map((key) => {
+                  const val = result[key];
+                  const isEmpty = val === "";
+                  return (
+                    <List.Item
+                      key={key}
+                      title={`Question ${key.toUpperCase()}`}
+                      description={isEmpty ? 'Unmarked' : `Bubbled: ${val}`}
+                      left={props => <List.Icon {...props} icon={isEmpty ? "circle-outline" : "check-circle"} color={isEmpty ? theme.colors.outline : theme.colors.primary} />}
+                    />
+                  );
+                })}
             </ScrollView>
           </Dialog.ScrollArea>
-          <Dialog.Actions>
-            <Button onPress={() => setShowResult(false)}>CLOSE</Button>
+          
+          <Dialog.Actions style={styles.dialogActions}>
+            <Button mode="contained" onPress={() => setShowResult(false)} style={{ width: '100%' }}>CLOSE & CONTINUE</Button>
           </Dialog.Actions>
         </Dialog>
       </Portal>
+
+      <Snackbar
+        visible={snackbarVisible}
+        onDismiss={() => setSnackbarVisible(false)}
+        duration={4000}
+        style={{ backgroundColor: theme.colors.error }}
+        action={{
+          label: 'OK',
+          onPress: () => setSnackbarVisible(false),
+          labelStyle: { color: '#ffffff' }
+        }}
+      >
+        <Text style={{ color: '#ffffff', fontWeight: '500' }}>{errorMessage}</Text>
+      </Snackbar>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
+  scrollContainer: {
+    paddingBottom: 40,
   },
   header: {
-    padding: 30,
-    alignItems: 'center',
-    justifyContent: 'center',
+    paddingTop: 70,
+    paddingHorizontal: 24,
+    paddingBottom: 30,
   },
   title: {
+    fontWeight: '900',
+    letterSpacing: -0.5,
+  },
+  heroSurface: {
+    marginHorizontal: 20,
+    borderRadius: 24,
+    overflow: 'hidden',
+    backgroundColor: '#1E293B',
+  },
+  heroContent: {
+    padding: 30,
+    alignItems: 'center',
+  },
+  mainButton: {
+    borderRadius: 30,
+    width: '100%',
+  },
+  mainButtonContent: {
+    height: 60,
+  },
+  mainButtonLabel: {
+    fontSize: 16,
     fontWeight: 'bold',
     letterSpacing: 1,
   },
-  content: {
+  sectionHeader: {
+    paddingHorizontal: 24,
+    marginTop: 40,
+    marginBottom: 16,
+  },
+  devCard: {
+    marginHorizontal: 20,
+    borderRadius: 16,
+    marginBottom: 12,
+  },
+  dialog: {
+    borderRadius: 24,
+    maxHeight: '85%',
+  },
+  dialogHeader: {
+    alignItems: 'center',
+    paddingTop: 30,
+    paddingBottom: 20,
+  },
+  scoreBubble: {
+    width: 120,
+    height: 120,
+    borderRadius: 60,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+  },
+  dialogScrollArea: {
+    paddingHorizontal: 0,
+    borderColor: 'rgba(255,255,255,0.1)',
+  },
+  dialogActions: {
     padding: 20,
-  },
-  card: {
-    marginBottom: 20,
-    borderRadius: 15,
-  },
+    justifyContent: 'center',
+  }
 });
 
 export default HomeScreen;
