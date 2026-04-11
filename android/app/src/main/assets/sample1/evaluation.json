@@ -1,0 +1,38 @@
+{
+  "source_type": "custom",
+  "options": {
+    "questions_in_order": [
+      "q1..20"
+    ],
+    "answers_in_order": [
+      "B",
+      "A",
+      "C",
+      "B",
+      "6",
+      "11",
+      "20",
+      "7",
+      "16",
+      "B",
+      "D",
+      "C",
+      "D",
+      "A",
+      "D",
+      "B",
+      "A",
+      "C",
+      "C",
+      "D"
+    ],
+    "should_explain_scoring": true
+  },
+  "marking_schemes": {
+    "DEFAULT": {
+      "correct": "4",
+      "incorrect": "-1",
+      "unmarked": "0"
+    }
+  }
+}
