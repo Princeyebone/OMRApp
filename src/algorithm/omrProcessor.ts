@@ -4,651 +4,400 @@ import {
   ObjectType,
   DataTypes,
   ColorConversionCodes,
-  InterpolationFlags,
-  BorderTypes,
   AdaptiveThresholdTypes,
   ThresholdTypes,
-  ReduceTypes,
+  RetrievalModes,
+  ContourApproximationModes,
+  LineTypes,
 } from 'react-native-fast-opencv';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface DetectedBubble {
-  x: number; y: number; w: number; h: number;
-}
-
-export interface QuestionRow {
-  questionNumber: number;
-  bubbles: DetectedBubble[];
-}
-
-export interface GridConfig {
-  canvasW: number;
-  canvasH: number;
-  bubblesPerQuestion: number;
-  questions: QuestionRow[];
-  totalQuestions: number;
-}
-
-export interface MarkingResult {
-  [questionNumber: number]: string;
-}
-
-export interface MarkingSummary {
-  results: MarkingResult;
-  correct: number;
-  incorrect: number;
-  skipped: number;
-  total: number;
-  score: number;
-}
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-// Fixed canvas we warp every sheet into
-const CANVAS_W = 1200;
-const CANVAS_H = 1600;
-
-// Fraction of canvas width to skip on each side (timing tracks)
-const EDGE_SKIP = 0.04;
-
-// Scanning — every SCAN_STEP pixels we sample a strip
-const SCAN_STEP = 2;
-
-// Minimum pixel run of consecutive dark strips to be treated as a real band
-const MIN_RUN_PX = 4;
-
-/**
- * Find the natural split in a value distribution via largest-gap analysis.
- * More robust than percentile averages for varying image quality.
- * Mirrors the proven Python get_global_threshold approach.
- */
-function jumpThreshold(values: number[], minJump = 15): number {
-  if (values.length < 3) return 128;
-  const sorted = [...values].sort((a, b) => a - b);
-  let maxJump = minJump;
-  let thresh  = (sorted[0] + sorted[sorted.length - 1]) / 2;
-  for (let i = 1; i < sorted.length - 1; i++) {
-    const jump = sorted[i + 1] - sorted[i - 1];
-    if (jump > maxJump) {
-      maxJump = jump;
-      thresh = sorted[i - 1] + jump / 2;
-    }
-  }
-  console.log(`[OMR] Jump thresh: min=${sorted[0].toFixed(1)} max=${sorted[sorted.length-1].toFixed(1)} maxJump=${maxJump.toFixed(1)} → thresh=${thresh.toFixed(1)}`);
-  return thresh;
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function ensureGrayscale(mat: any): any {
-  const info     = OpenCV.toJSValue(mat) as any;
-  const channels = (info.type >> 3) + 1;
-  if (channels === 1) return mat;
-  const gray = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
-  if (channels === 3) {
-    OpenCV.invoke('cvtColor', mat, gray, ColorConversionCodes.COLOR_BGR2GRAY);
-  } else {
-    OpenCV.invoke('cvtColor', mat, gray, ColorConversionCodes.COLOR_RGBA2GRAY);
-  }
-  return gray;
-}
-
-function downscale(mat: any, maxDim: number): any {
-  const info    = OpenCV.toJSValue(mat) as any;
-  const biggest = Math.max(info.cols, info.rows);
-  if (biggest <= maxDim) return mat;
-  const scale   = maxDim / biggest;
-  const newCols = Math.floor(info.cols * scale);
-  const newRows = Math.floor(info.rows * scale);
-  const out     = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
-  const sz      = OpenCV.createObject(ObjectType.Size, newCols, newRows);
-  OpenCV.invoke('resize', mat, out, sz, 0, 0, InterpolationFlags.INTER_LINEAR);
-  return out;
-}
-
-/**
- * Enhance contrast and reduce noise for robust grid detection.
- * Histogram equalization normalizes brightness across different image qualities.
- */
-async function preprocess(grayMat: any, checkCancel?: () => Promise<void>): Promise<any> {
-  try {
-    if (checkCancel) await checkCancel();
-    // 1. Light blur to reduce digital noise
-    const blurred = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
-    const ksize   = OpenCV.createObject(ObjectType.Size, 3, 3);
-    OpenCV.invoke('GaussianBlur', grayMat, blurred, ksize, 1.0);
-    
-    // 2. Adaptive Thresholding: Turns the sheet into high-contrast B&W
-    const binary = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
-    OpenCV.invoke('adaptiveThreshold', 
-      blurred, 
-      binary, 
-      255, 
-      AdaptiveThresholdTypes.ADAPTIVE_THRESH_GAUSSIAN_C, 
-      ThresholdTypes.THRESH_BINARY, 
-      31, // Slightly smaller block for sharper detail
-      15  // Higher C to aggressively remove gray noise
-    );
-    
-    console.log('[OMR] Preprocessing applied: GaussianBlur + adaptiveThreshold');
-    
-    // 3. Dilate: Thicken the black ink slightly (1 iteration) to make bubbles solid
-    const kernel = OpenCV.createObject(ObjectType.Mat, 3, 3, DataTypes.CV_8U);
-    const anchor = OpenCV.createObject(ObjectType.Point, -1, -1);
-    const borderValue = OpenCV.createObject(ObjectType.Scalar, 0, 0, 0, 0);
-    OpenCV.invoke('dilate' as any, binary, binary, kernel, anchor, 1, 0, borderValue);
-    
-    return binary;
-  } catch (e) {
-    console.log('[OMR] Preprocess failed, using raw image:', e);
-    return grayMat;
-  }
-}
-
-/**
- * Safe mean of a rectangle on `grayMat`.
- * Reads actual Mat dimensions to prevent out-of-bounds crashes.
- */
-function roiMean(
-  grayMat: any,
-  x: number, y: number, w: number, h: number,
-  matW: number, matH: number,
-): number {
-  try {
-    // Read actual Mat dimensions for safety
-    const info = OpenCV.toJSValue(grayMat) as any;
-    const actualW = info.cols ?? matW;
-    const actualH = info.rows ?? matH;
-
-    x = Math.max(0, Math.floor(x));
-    y = Math.max(0, Math.floor(y));
-    w = Math.floor(w);
-    h = Math.floor(h);
-
-    // Clamp width/height so rect stays inside the actual image
-    if (x >= actualW || y >= actualH) return 255;
-    w = Math.max(1, Math.min(w, actualW - x));
-    h = Math.max(1, Math.min(h, actualH - y));
-
-    const rect = OpenCV.createObject(ObjectType.Rect, x, y, w, h);
-    const roi  = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
-    OpenCV.invoke('crop', grayMat, roi, rect);
-    const meanVal = OpenCV.invoke('mean', roi) as any;
-    return (OpenCV.toJSValue(meanVal) as any).a ?? 255;
-  } catch (e) {
-    return 255;
-  }
-}
-
-/**
- * Find runs of consecutive values below `threshold` in an array.
- * Returns {start, end, centre} in pixel coordinates.
- * `startPx` = pixel coordinate of index 0.  `step` = pixels per index.
- */
-function findDarkBands(
-  values: number[],
-  startPx: number,
-  step: number,
-  threshold: number,
-  minRunPx: number,
-): Array<{ start: number; end: number; centre: number }> {
-  const bands: Array<{ start: number; end: number; centre: number }> = [];
-  let inBand   = false;
-  let bandStart = 0;
-
-  for (let i = 0; i < values.length; i++) {
-    const px = startPx + i * step;
-    if (values[i] < threshold) {
-      if (!inBand) { inBand = true; bandStart = px; }
-    } else {
-      if (inBand) {
-        inBand = false;
-        if (px - bandStart >= minRunPx) {
-          bands.push({ start: bandStart, end: px, centre: (bandStart + px) / 2 });
-        }
-      }
-    }
-  }
-  if (inBand) {
-    const end = startPx + values.length * step;
-    if (end - bandStart >= minRunPx) {
-      bands.push({ start: bandStart, end, centre: (bandStart + end) / 2 });
-    }
-  }
-  return bands;
-}
-
-// ─── Alignment ───────────────────────────────────────────────────────────────
-
-/**
- * Simplified alignment: resize to fixed canvas.
- * Timing track cropping is handled later by EDGE_SKIP during scanning.
- */
-/**
- * Attempts to find the 4 corners of the OMR sheet and warps it to a top-down view.
- * If no sheet is detected, falls back to a simple resize.
- */
-function alignSheet(grayMat: any): any {
-  const out = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
-  const info = OpenCV.toJSValue(grayMat) as any;
-  const W = info.cols;
-  const H = info.rows;
-
-  try {
-    // Basic sheet detection logic (simplified for stability)
-    console.log(`[OMR] Alignment scanner: ${W}x${H}`);
-  } catch (e) {
-    console.log('[OMR] Alignment logic error:', e);
-  }
-
-  // Fallback: Resize to standard canvas
-  const sz  = OpenCV.createObject(ObjectType.Size, CANVAS_W, CANVAS_H);
-  OpenCV.invoke('resize', grayMat, out, sz, 0, 0, InterpolationFlags.INTER_LINEAR);
-  return out;
-}
-
-// ─── Grid detection (column-first) ───────────────────────────────────────────
-
-/**
- * Merge an array of sorted centre positions: any two positions within
- * `maxGap` of each other collapse into their average.
- */
-function mergeCentres(centres: number[], maxGap: number): number[] {
-  if (centres.length === 0) return [];
-  const sorted = [...centres].sort((a, b) => a - b);
-  const out: number[] = [sorted[0]];
-  for (let i = 1; i < sorted.length; i++) {
-    if (sorted[i] - out[out.length - 1] <= maxGap) {
-      out[out.length - 1] = (out[out.length - 1] + sorted[i]) / 2;
-    } else {
-      out.push(sorted[i]);
-    }
-  }
-  return out;
-}
-
-async function detectBubbleGrid(
-  grayCanvas: any,
-  bubblesPerQuestion: number,
-  checkCancel?: () => Promise<void>,
-): Promise<QuestionRow[]> {
-  const W = CANVAS_W;
-  const H = CANVAS_H;
-
-  const left  = Math.floor(W * EDGE_SKIP);
-  const right = Math.floor(W * (1 - EDGE_SKIP));
-
-  // Estimate question area: skip top 20% (header) and bottom 10% (footer)
-  // Wider scan region for multi-column sheets (5-col × 20-row)
-  const qTop = Math.floor(H * 0.15);
-  const qBot = Math.floor(H * 0.93);
-  const spanH = qBot - qTop;
-
-  // ── Phase A: VERTICAL 5-Strip Sampling Scan (Finding columns) ────────
-  // We scan 5 horizontal strips across the sheet to catch all bubble rows.
-  const colProfiles: number[] = [];
-
-  for (let x = left; x < right - SCAN_STEP; x += SCAN_STEP) {
-     if (x % (SCAN_STEP * 20) === 0 && checkCancel) await checkCancel();
-     const v1 = roiMean(grayCanvas, x, qTop + 100, SCAN_STEP, 60, W, H);
-     const v2 = roiMean(grayCanvas, x, qTop + Math.floor(spanH*0.25), SCAN_STEP, 60, W, H);
-     const v3 = roiMean(grayCanvas, x, qTop + Math.floor(spanH*0.5), SCAN_STEP, 60, W, H);
-     const v4 = roiMean(grayCanvas, x, qTop + Math.floor(spanH*0.75), SCAN_STEP, 60, W, H);
-     const v5 = roiMean(grayCanvas, x, qBot - 150, SCAN_STEP, 60, W, H);
-     const darkness = 255 - (v1+v2+v3+v4+v5)/5;
-     colProfiles.push(darkness);
-  }
-
-  const minV = Math.min(...colProfiles);
-  const maxV = Math.max(...colProfiles);
-  console.log(`[OMR] Activity min:${minV.toFixed(1)} max:${maxV.toFixed(1)} n:${colProfiles.length}`);
-  
-  // High-sensitivity 8% threshold
-  const colThreshVal = Math.max(6, maxV * 0.08); 
-  
-  const activeBands: Array<{ start: number; end: number; centre: number }> = [];
-  let inBand = false;
-  let bandStart = 0;
-
-  for (let i = 0; i < colProfiles.length; i++) {
-    const px = left + i * SCAN_STEP;
-    if (colProfiles[i] > colThreshVal) {
-      if (!inBand) { inBand = true; bandStart = px; }
-    } else {
-      if (inBand) {
-        inBand = false;
-        // Filter: Keep bands at least 4 pixels wide (2 samples)
-        if (px - bandStart >= 4) { 
-          activeBands.push({ start: bandStart, end: px, centre: (bandStart + px) / 2 });
-        }
-      }
-    }
-  }
-  
-  console.log(`[OMR] Detected ${activeBands.length} activity bands`);
-  if (activeBands.length > 0) {
-    const widths = activeBands.map(b => (b.end - b.start).toFixed(0));
-    const centres = activeBands.map(b => b.centre.toFixed(0));
-    console.log(`[OMR] Band widths: ${widths.join(',')}`);
-    console.log(`[OMR] Band centres: ${centres.join(',')}`);
-  }
-
-  if (activeBands.length < bubblesPerQuestion) {
-    console.log('[OMR] Not enough activity columns detected');
-    return [];
-  }
-  
-  const rawXCentres = activeBands.map(b => b.centre);
-  
-  // ── Phase B: VERTICAL Consensus Scan (Finding Rows) ──────────────
-  // We sample 8 columns including the extreme edges (Timing Tracks).
-  // We use a WIDE (20px) window to catch tracks even if paper is tilted.
-  const rowProfiles: number[] = [];
-  const colCount = activeBands.length;
-  const colIdx = [];
-  for (let i=0; i<8; i++) colIdx.push(Math.floor(i * (colCount-1) / 7));
-  const sampleX = colIdx.map(i => activeBands[i].centre);
-
-  for (let y = qTop; y < qBot - 4; y += 4) {
-    if (y % 40 === 0 && checkCancel) await checkCancel();
-    let sumDark = 0;
-    for (const cx of sampleX) {
-       // Use a wider 20px window for vertical stability
-       sumDark += roiMean(grayCanvas, cx - 10, y, 20, 4, W, H);
-    }
-    rowProfiles.push(255 - (sumDark / sampleX.length));
-  }
-
-  // Percentile-based threshold (Top 15% of darkness)
-  const sortedProfiles = [...rowProfiles].sort((a,b) => b-a);
-  const rowThresh = Math.max(8, sortedProfiles[Math.floor(rowProfiles.length * 0.15)] || 10);
-  
-  let rawRowCentres: number[] = [];
-  let inRow = false;
-  let rowStart = 0;
-  for (let i = 0; i < rowProfiles.length; i++) {
-    const py = qTop + i * 4;
-    if (rowProfiles[i] > rowThresh) {
-      if (!inRow) { inRow = true; rowStart = py; }
-    } else {
-      if (inRow) {
-        inRow = false;
-        if (py - rowStart >= 4) rawRowCentres.push((rowStart + py) / 2);
-      }
-    }
-  }
-
-  // ── Smart Row Interpolation ──
-  // If we have missing rows, fill them using the median gap
-  let rowCentres = [...rawRowCentres].sort((a,b) => a-b);
-  if (rowCentres.length > 2 && rowCentres.length < 20) {
-     const gaps: number[] = [];
-     for(let i=1; i<rowCentres.length; i++) gaps.push(rowCentres[i] - rowCentres[i-1]);
-     const medGap = [...gaps].sort((a,b) => a-b)[Math.floor(gaps.length/2)];
-     
-     const interpolated: number[] = [rowCentres[0]];
-     for(let i=1; i<rowCentres.length; i++) {
-        const gap = rowCentres[i] - interpolated[interpolated.length-1];
-        if (gap > medGap * 1.7) { // Gap found!
-           const missingCount = Math.round(gap / medGap) - 1;
-           for(let j=1; j<=missingCount; j++) {
-              interpolated.push(interpolated[interpolated.length-1] + medGap);
-           }
-        }
-        interpolated.push(rowCentres[i]);
-     }
-     rowCentres = interpolated;
-  }
-
-  console.log(`[OMR] Final row centres: ${rowCentres.length} (incl. interpolation)`);
-  if (rowCentres.length === 0) return [];
-
-  // Filter for the 20 rows that belong to the bubble grid (removing header/footer noise)
-  // Typically, these are the 20 rows in the middle with consistent spacing
-  let finalRowCentres = [...rowCentres];
-  if (finalRowCentres.length > 20) {
-     // Sort by Y and take the 20 rows that are most likely the bubble grid
-     // (Usually skipping the top few if they are row-labeled questions)
-     const midIndex = Math.floor(finalRowCentres.length / 2);
-     finalRowCentres = finalRowCentres.slice(Math.max(0, midIndex - 10), Math.max(0, midIndex - 10) + 20);
-  }
-  console.log(`[OMR] Filtered to ${finalRowCentres.length} grid rows`);
-
-  // ── Phase C: Grid Assembly ──────────────────────────────────────
-  // We expect 20 bubble columns. Timing tracks are at the far edges.
-  // We filter out anything that isn't part of the core 20-column block.
-  const allCentres = activeBands.map(b => b.centre).sort((a,b) => a-b);
-  
-  // Identify exactly 20 bubble columns by looking for the tightest cluster
-  const bubbleCols = allCentres.filter(x => x > left + 40 && x < right - 40);
-  if (bubbleCols.length > 20) {
-     const overCount = bubbleCols.length - 20;
-     // Usually stray lines are at the very far edges
-     bubbleCols.splice(0, Math.floor(overCount/2));
-     bubbleCols.splice(20);
-  }
-  console.log(`[OMR] Filtered to ${bubbleCols.length} bubble columns`);
-
-  const bubbleW = 12;
-  const bubbleH = 12;
-
-  const questionRows: QuestionRow[] = [];
-  let qNum = 1;
-
-  for (const yC of finalRowCentres) {
-    // Each physical row contains multiple questions (5 columns across)
-    for (let c = 0; c < bubbleCols.length; c += bubblesPerQuestion) {
-       const opts = bubbleCols.slice(c, c + bubblesPerQuestion);
-       if (opts.length === bubblesPerQuestion) {
-          const bubbles: DetectedBubble[] = opts.map(cx => ({
-            x: Math.floor(cx - bubbleW / 2),
-            y: Math.floor(yC - bubbleH / 2),
-            w: bubbleW,
-            h: bubbleH,
-          }));
-          questionRows.push({ questionNumber: qNum++, bubbles });
-       }
-    }
-  }
-
-  console.log(`[OMR] Final grid: ${questionRows.length} questions mapped.`);
-  return questionRows;
-}
-
-// ─── Darkness measurement ────────────────────────────────────────────────────
-
-
-function measureDarkness(grayCanvas: any, bubbles: DetectedBubble[]): number[] {
-  return bubbles.map(b =>
-    roiMean(grayCanvas, b.x, b.y, b.w, b.h, CANVAS_W, CANVAS_H),
-  );
-}
-
-function globalThreshold(intensities: number[]): number {
-  if (intensities.length < 2) return 128;
-  const s = [...intensities].sort((a, b) => a - b);
-  let maxJump = 20;
-  let thresh  = (s[0] + s[s.length - 1]) / 2;
-  for (let i = 1; i < s.length - 1; i++) {
-    const jump = s[i + 1] - s[i - 1];
-    if (jump > maxJump) { maxJump = jump; thresh = s[i - 1] + jump / 2; }
-  }
-  return thresh;
-}
-
-// ─── Public API ───────────────────────────────────────────────────────────────
-
 export class OMRProcessor {
-
-  static async learnGrid(
-    imagePath: string,
-    bubblesPerQuestion: number,
-    onProgress?: (m: string) => boolean | void,
-  ): Promise<GridConfig> {
-    const yf = () => new Promise(r => setTimeout(() => r(true), 10));
-    const checkCancel = async () => {
-      if (onProgress && onProgress('') === true) throw new Error('CANCELLED');
-    };
+  static async processImage(imagePath: string): Promise<{ binary: string, outlined: string, cropped: string | null, scored: string | null, subColumns: string | null, rows: string | null, finalScored: string | null }> {
     try {
-      if (onProgress) onProgress('Loading image…');
-      await yf();
-      await checkCancel();
-      const b64  = await RNFS.readFile(imagePath, 'base64');
-      let imgMat = OpenCV.base64ToMat(b64);
-      imgMat     = downscale(imgMat, 1400);
-      const gray = ensureGrayscale(imgMat);
+      const b64 = await RNFS.readFile(imagePath, 'base64');
+      const imgMat = OpenCV.base64ToMat(b64);
 
-      if (onProgress) onProgress('Aligning sheet…');
-      await yf();
-      await checkCancel();
-      const warped     = alignSheet(gray);
-      const warpedGray = ensureGrayscale(warped);
-      const enhanced   = await preprocess(warpedGray, checkCancel);
+      let gray = imgMat;
+      const info = OpenCV.toJSValue(imgMat) as Record<string, any>;
+      const channels = (info.type >> 3) + 1;
 
-      if (onProgress) onProgress('Detecting bubble grid…');
-      await yf();
-      await checkCancel();
-      const questions = await detectBubbleGrid(enhanced, bubblesPerQuestion, checkCancel);
+      if (channels > 1) {
+        gray = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+        if (channels === 3) {
+          OpenCV.invoke('cvtColor', imgMat, gray, ColorConversionCodes.COLOR_BGR2GRAY);
+        } else {
+          OpenCV.invoke('cvtColor', imgMat, gray, ColorConversionCodes.COLOR_RGBA2GRAY);
+        }
+      }
 
-      if (questions.length === 0) {
-        throw new Error(
-          'No bubble rows detected. Check logcat "[OMR]" tags for intensity values, then report back.',
+      // 1. Adaptive Threshold (Inverse) to get white items on black background
+      const binary = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+      OpenCV.invoke('adaptiveThreshold',
+        gray,
+        binary,
+        255,
+        AdaptiveThresholdTypes.ADAPTIVE_THRESH_GAUSSIAN_C,
+        ThresholdTypes.THRESH_BINARY_INV,
+        31,
+        15
+      );
+
+      // We need a color version to draw green rectangles so they are easily visible
+      const drawImg = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+      OpenCV.invoke('cvtColor', binary, drawImg, ColorConversionCodes.COLOR_GRAY2BGR);
+
+      // 2. Find contours
+      // We must use PointVectorOfVectors so OpenCV's bridge serialization knows to export actual X/Y points, not just Mat metadata.
+      const contours = OpenCV.createObject(ObjectType.PointVectorOfVectors);
+      OpenCV.invoke('findContours', binary, contours, RetrievalModes.RETR_EXTERNAL, ContourApproximationModes.CHAIN_APPROX_SIMPLE);
+
+      // 3. Process contours
+      const parsed = OpenCV.toJSValue(contours) as any;
+      const jsContours: { x: number, y: number }[][] = parsed && parsed.array ? parsed.array : [];
+
+      console.log(`[OMR] Detected ${jsContours.length} raw contours.`);
+
+      if (jsContours.length > 5000) {
+        console.log('[OMR] 🧠 too many contours');
+      }
+
+      const boundingBoxes = jsContours.map((pts) => {
+        if (!pts || pts.length === 0) return null;
+
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of pts) {
+          if (p.x < minX) minX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y > maxY) maxY = p.y;
+        }
+
+        if (minX === Infinity || maxX === -Infinity) return null;
+
+        return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+      }).filter(Boolean) as { x: number, y: number, w: number, h: number }[];
+
+      console.log(`[OMR] 🧠 Parsed ${boundingBoxes.length} valid bounding boxes.`);
+
+      if (boundingBoxes.length === 0 && jsContours.length > 0) {
+        console.log('[OMR] 🚨 PARSE ERROR: jsContours[0] looks like:', JSON.stringify(jsContours[0]));
+      }
+
+      // 4. Draw ALL boxes to see exactly what we caught!
+      for (const box of boundingBoxes) {
+        const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
+        const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
+        const color = OpenCV.createObject(ObjectType.Scalar, 0, 255, 0, 255); // BGR
+        OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, 4, LineTypes.LINE_8);
+      }
+
+      // 5. Filter into rectangle candidates (generous filter)
+      const rectCandidates = boundingBoxes.filter(b => b.w > 5 && b.h > 5); // Just discard tiny noise 
+      console.log(`[OMR] 🧠 ${rectCandidates.length} potential tracking blocks after size filter.`);
+
+      // 6. Group by X position
+      const xTolerance = 25; // Giving more room for slightly skewed tracks
+      const groups: { centerX: number; items: typeof rectCandidates }[] = [];
+
+      for (const box of rectCandidates) {
+        const boxCenterX = box.x + box.w / 2;
+        let foundGroup = false;
+        for (const g of groups) {
+          if (Math.abs(g.centerX - boxCenterX) <= xTolerance) {
+            g.items.push(box);
+            g.centerX = g.items.reduce((sum, item) => sum + (item.x + item.w / 2), 0) / g.items.length;
+            foundGroup = true;
+            break;
+          }
+        }
+        if (!foundGroup) {
+          groups.push({ centerX: boxCenterX, items: [box] });
+        }
+      }
+
+      // 7. Count rectangles per group & print
+      groups.sort((a, b) => b.items.length - a.items.length);
+      console.log(`[OMR] 🧠 Found ${groups.length} X-coordinate groups`);
+
+      const topGroups = groups.slice(0, Math.min(5, groups.length)); // Print top 5
+      for (let i = 0; i < topGroups.length; i++) {
+        console.log(`[OMR] 🧠 Group ${i + 1} | X: ${Math.round(topGroups[i].centerX)} | Count: ${topGroups[i].items.length}`);
+      }
+
+      if (groups.length === 0 || groups[0].items.length < 5) {
+        console.log('[OMR] 🧠 tracks not detected (highest count in a column is too low)');
+      }
+
+      // Highlight the rectangles in the top 2 groups
+      if (topGroups.length > 0) {
+        for (const box of topGroups[0].items) {
+          const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
+          const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
+          const color = OpenCV.createObject(ObjectType.Scalar, 0, 0, 255, 255); // Red
+          OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, -1, LineTypes.LINE_8);
+        }
+      }
+      if (topGroups.length > 1) {
+        for (const box of topGroups[1].items) {
+          const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
+          const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
+          const color = OpenCV.createObject(ObjectType.Scalar, 255, 0, 0, 255); // Blue
+          OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, -1, LineTypes.LINE_8);
+        }
+      }
+
+      let croppedPath: string | null = null;
+      let scoredPath: string | null = null;
+      let subColumnsPath: string | null = null;
+      let rowsPath: string | null = null;
+      let finalScoredPath: string | null = null;
+
+      // 8. Crop the internal answer area
+      if (topGroups.length >= 2) {
+        // Sort the two timing tracks dynamically (left to right)
+        const tracks = [topGroups[0], topGroups[1]].sort((a, b) => a.centerX - b.centerX);
+        const leftTrack = tracks[0];
+        const rightTrack = tracks[1];
+
+        // Inner edge of left track = max(box.x + box.w)
+        const leftEdge = Math.max(...leftTrack.items.map(b => b.x + b.w));
+        // Inner edge of right track = min(box.x)
+        const rightEdge = Math.min(...rightTrack.items.map(b => b.x));
+
+        const topEdge = Math.min(
+          ...leftTrack.items.map(b => b.y),
+          ...rightTrack.items.map(b => b.y)
         );
-      }
 
-      const config: GridConfig = {
-        canvasW: CANVAS_W,
-        canvasH: CANVAS_H,
-        bubblesPerQuestion,
-        questions,
-        totalQuestions: questions.length,
-      };
+        const bottomEdge = Math.max(
+          ...leftTrack.items.map(b => b.y + b.h),
+          ...rightTrack.items.map(b => b.y + b.h)
+        );
 
-      OpenCV.clearBuffers();
-      return config;
-    } catch (e) {
-      OpenCV.clearBuffers();
-      throw e;
-    }
-  }
+        // TWEAK THESE 4 VARIABLES TO FIX THE OVERALL CROP OUTLINE:
+        // 1. Horizontal borders:
+        const leftTrim = 2;       // If left edge of crop is off, adjust this
 
-  static async markSheet(
-    imagePath: string,
-    config: GridConfig,
-    answerKey: string[],
-    onProgress?: (m: string) => boolean | void,
-  ): Promise<MarkingSummary> {
-    const yf = () => new Promise(r => setTimeout(() => r(true), 10));
-    const checkCancel = async () => {
-      if (onProgress && onProgress('') === true) throw new Error('CANCELLED');
-    };
-    try {
-      if (onProgress) onProgress('Loading image…');
-      await yf();
-      await checkCancel();
-      const b64  = await RNFS.readFile(imagePath, 'base64');
-      let imgMat = OpenCV.base64ToMat(b64);
-      imgMat     = downscale(imgMat, 1400);
-      const gray = ensureGrayscale(imgMat);
- 
-      if (onProgress) onProgress('Aligning sheet…');
-      await yf();
-      await checkCancel();
-      const warped     = alignSheet(gray);
-      const warpedGray = ensureGrayscale(warped);
-      const enhanced   = await preprocess(warpedGray, checkCancel);
- 
-      if (onProgress) onProgress('Locking grid alignment…');
-      await yf();
-      await checkCancel();
-      
-      // Dynamic Locking: Find the current grid's X-offset to handle camera shift
-      const currentEnhanced = await preprocess(warpedGray, checkCancel);
-      // We do a fast scan of the first few rows to find the X bands
-      const colProfiles: number[] = [];
-      const spanH = CANVAS_H * 0.78;
-      const qTop = CANVAS_H * 0.15;
-      for (let x = 0; x < CANVAS_W - 2; x += 2) {
-         const v = roiMean(currentEnhanced, x, qTop + 100, 2, 100, CANVAS_W, CANVAS_H);
-         colProfiles.push(255 - v);
-      }
-      const currentMaxV = Math.max(...colProfiles);
-      const currentBands = findDarkBands(colProfiles, 0, 2, currentMaxV * 0.10, 4);
-      
-      let dX = 0;
-      if (currentBands.length > 0 && config.questions.length > 0) {
-         const bubble1X = config.questions[0].bubbles[0].x;
-         // Find the closest band in the new scan
-         const closest = [...currentBands].sort((a,b) => Math.abs(a.centre - bubble1X) - Math.abs(b.centre - bubble1X))[0];
-         dX = closest.centre - bubble1X;
-      }
-      console.log(`[OMR] Alignment locked. Shift: dX=${dX.toFixed(1)}`);
+        // 2. Vertical borders (the upper and lower parts of the blue lines):
+        // If the top of the blue line is too high/low, tweak topTrim.
+        // Positive number moves the top downwards. Negative moves it upwards.
+        const topTrim = 5;
 
-      if (onProgress) onProgress('Grading answers…');
-      await yf();
-      await checkCancel();
- 
-      const OPTION_LETTERS = ['A', 'B', 'C', 'D', 'E'];
-      const results: MarkingResult = {};
-      let correct = 0;
-      let incorrect = 0;
-      let skipped = 0;
+        // If the bottom of the blue line is too high/low, tweak bottomPadding.
+        // Positive number extends the line downwards. Negative shrinks it upwards.
+        const bottomPadding = 7;
 
-      for (let i = 0; i < config.questions.length; i++) {
-        const q = config.questions[i];
-        if (i % 5 === 0) await checkCancel(); // Check every 5 questions for efficiency
-        // Shift bubbles by dX before measuring
-        const shiftedBubbles = q.bubbles.map(b => ({
-           ...b,
-           x: Math.max(0, Math.min(CANVAS_W - b.w, b.x + dX))
-        }));
+        const roiX = leftEdge + leftTrim;
+        const roiY = topEdge + topTrim;
+        const roiW = rightEdge - roiX;
+        const roiH = (bottomEdge + bottomPadding) - roiY;
 
-        const intensities = measureDarkness(currentEnhanced, shiftedBubbles);
-        
-        const markedIdx = intensities
-          .map((v, i) => ({ v, i }))
-          .filter(o => o.v < 170) // Slightly stricter marking (170 instead of 180)
-          .sort((a,b) => a.v - b.v); 
+        if (roiW > 0 && roiH > 0) {
+          console.log(`[OMR] 🧠 Initial Timing Track ROI: X=${roiX}, Y=${roiY}, W=${roiW}, H=${roiH}`);
+          const roiRect = OpenCV.createObject(ObjectType.Rect, roiX, roiY, roiW, roiH);
+          const croppedMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+          OpenCV.invoke('crop', binary, croppedMat, roiRect);
 
-        let finalAns = '';
-        if (markedIdx.length === 0) {
-           skipped++;
-        } else if (markedIdx.length === 1) {
-           finalAns = OPTION_LETTERS[markedIdx[0].i] || '';
+          // The 3rd image is now the pristine cropped answer area
+          const colorCroppedMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+          OpenCV.invoke('cvtColor', croppedMat, colorCroppedMat, ColorConversionCodes.COLOR_GRAY2BGR);
+
+          // The 4th image receives the scored reticles
+          const scoredMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+          OpenCV.invoke('cvtColor', croppedMat, scoredMat, ColorConversionCodes.COLOR_GRAY2BGR);
+
+          // The 5th image receives the sub-column (inner) splits
+          const subColsMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+          OpenCV.invoke('cvtColor', croppedMat, subColsMat, ColorConversionCodes.COLOR_GRAY2BGR);
+
+          // The 6th image receives the final row splits
+          const rowsMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+          OpenCV.invoke('cvtColor', croppedMat, rowsMat, ColorConversionCodes.COLOR_GRAY2BGR);
+
+          // The 7th image receives the final detected bubbles highlighted
+          const finalScoredMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+          OpenCV.invoke('cvtColor', croppedMat, finalScoredMat, ColorConversionCodes.COLOR_GRAY2BGR);
+
+          // Mathematical column splitting (Physical Layout Model)
+          const numCols = 5;
+
+          // TWEAK THESE 3 VARIABLES FOR MAIN COLUMNS:
+          const leftMargin = 21;  // Pixels of white margin on the far left (before Col 1)
+          const rightMargin = 22; // Pixels of white margin on the far right (after Col 5)
+          const gapWidth = 15;    // Pixels of empty gap between Columns
+
+          // Total Width = leftMargin + (5 * colWidth) + (4 * gapWidth) + rightMargin
+          const colWidth = (roiW - leftMargin - rightMargin - ((numCols - 1) * gapWidth)) / numCols;
+
+          // TWEAK THESE VARIABLES FOR INNER SUB-COLUMNS:
+          // The Q column starts at the edge of the main column. You define its width.
+          const qStartOffset = 0;  // Push the Question Number (YELLOW) block right by 2px. Smaller number moves it left.
+          const qWidth = 25;       // Width of the Question Number block
+
+          // Where do the A, B, C, D bubbles actually begin? 
+          // (Pixels from the left edge of the main column). Smaller number moves the GREEN options left!
+          const optionsStartOffset = 28;
+
+          // Exclusively draw the bounds of the 5 Columns on the 4th Image
+          // and the inner sub-columns on the 5th Image.
+          for (let c = 0; c < numCols; c++) {
+            const startX = Math.round(leftMargin + (c * (colWidth + gapWidth)));
+            const endX = Math.round(startX + colWidth);
+
+            const pt1 = OpenCV.createObject(ObjectType.Point, startX, 0);
+            const pt2 = OpenCV.createObject(ObjectType.Point, endX, roiH);
+
+            const colColor = OpenCV.createObject(ObjectType.Scalar, 255, 0, 0, 255); // Blue
+            OpenCV.invoke('rectangle', scoredMat, pt1, pt2, colColor, 3, LineTypes.LINE_8);
+
+            // -------------------------------------------------------------
+            // DRAW SUB-COLUMNS ON THE 5TH IMAGE
+            // -------------------------------------------------------------
+            // 1. Draw Q Column
+            const qStartX = startX + qStartOffset;
+            const qEndX = qStartX + qWidth;
+            const qPt1 = OpenCV.createObject(ObjectType.Point, Math.round(qStartX), 0);
+            const qPt2 = OpenCV.createObject(ObjectType.Point, Math.round(qEndX), roiH);
+            const qColor = OpenCV.createObject(ObjectType.Scalar, 0, 255, 255, 255); // Yellow for Q
+            OpenCV.invoke('rectangle', subColsMat, qPt1, qPt2, qColor, 2, LineTypes.LINE_8);
+
+            // 2. Draw Options (A, B, C, D)
+            // They start at the explicit optionsStartOffset, and since they are equally spaced,
+            // we perfectly divide the remaining mathematical width uniformly by 4!
+            const optColor = OpenCV.createObject(ObjectType.Scalar, 0, 255, 0, 255); // Green for Options
+
+            const optionSpace = colWidth - optionsStartOffset;
+            const singleOptionWidth = optionSpace / 4;
+
+            for (let opt = 0; opt < 4; opt++) {
+              const oStartX = startX + optionsStartOffset + (opt * singleOptionWidth);
+              const oEndX = oStartX + singleOptionWidth;
+
+              const oPt1 = OpenCV.createObject(ObjectType.Point, Math.round(oStartX), 0);
+              const oPt2 = OpenCV.createObject(ObjectType.Point, Math.round(oEndX), roiH);
+              OpenCV.invoke('rectangle', subColsMat, oPt1, oPt2, optColor, 2, LineTypes.LINE_8);
+            }
+          }
+
+          // -------------------------------------------------------------
+          // DRAW ROWS ON THE 6TH IMAGE
+          // -------------------------------------------------------------
+          const numRows = 20;
+          const rowHeight = roiH / numRows;
+          const rowColor = OpenCV.createObject(ObjectType.Scalar, 255, 165, 0, 255); // Orange
+
+          for (let r = 0; r <= numRows; r++) {
+             const rowY = Math.round(r * rowHeight);
+             const pt1 = OpenCV.createObject(ObjectType.Point, 0, rowY);
+             const pt2 = OpenCV.createObject(ObjectType.Point, roiW, rowY);
+             OpenCV.invoke('line', rowsMat, pt1, pt2, rowColor, 2, LineTypes.LINE_8);
+          }
+
+          // -------------------------------------------------------------
+          // STEP 7: SCORE ALL BUBBLES
+          // -------------------------------------------------------------
+          const padding = 2; // Shave off border grid lines
+
+          for (let c = 0; c < numCols; c++) {
+            const startX = Math.round(leftMargin + (c * (colWidth + gapWidth)));
+            const optionSpace = colWidth - optionsStartOffset;
+            const singleOptionWidth = optionSpace / 4;
+
+            for (let r = 0; r < numRows; r++) {
+               const rowY = Math.round(r * rowHeight);
+
+               let bestOpt = -1;
+               let bestScore = -1;
+               let scores = [];
+
+               for (let opt = 0; opt < 4; opt++) {
+                  const bubbleX = startX + optionsStartOffset + (opt * singleOptionWidth);
+                  
+                  const safeX = Math.round(bubbleX + padding);
+                  const safeY = Math.round(rowY + padding);
+                  const safeW = Math.round(singleOptionWidth - (2 * padding));
+                  const safeH = Math.round(rowHeight - (2 * padding));
+
+                  const cellRect = OpenCV.createObject(ObjectType.Rect, safeX, safeY, safeW, safeH);
+                  const cellMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+                  OpenCV.invoke('crop', croppedMat, cellMat, cellRect);
+                  
+                  // Count white pixels (pencil marks)
+                  const countObj = OpenCV.invoke('countNonZero', cellMat) as { value: number };
+                  const count = countObj.value;
+                  scores.push(count);
+
+                  if (count > bestScore) {
+                     bestScore = count;
+                     bestOpt = opt;
+                  }
+               }
+
+               console.log(`[OMR] 🧠 Col ${c+1} Row ${r+1} | Densities: [${scores.join(', ')}] -> Selected: ${['A','B','C','D'][bestOpt] || 'None'}`);
+
+               // Highlight the selected answer on finalScoredMat if it passes a minimum density test
+               // (Prevents scoring completely empty rows)
+               const minDensityThreshold = 20; 
+               if (bestScore > minDensityThreshold && bestOpt !== -1) {
+                  const winningX = Math.round(startX + optionsStartOffset + (bestOpt * singleOptionWidth));
+                  const pt1 = OpenCV.createObject(ObjectType.Point, winningX, rowY);
+                  const pt2 = OpenCV.createObject(ObjectType.Point, winningX + Math.round(singleOptionWidth), rowY + Math.round(rowHeight));
+                  
+                  const markColor = OpenCV.createObject(ObjectType.Scalar, 0, 0, 255, 255); // Red Frame
+                  OpenCV.invoke('rectangle', finalScoredMat, pt1, pt2, markColor, 3, LineTypes.LINE_8);
+               }
+            }
+          }
+
+          // Save cropped grid image
+          const croppedFileName = `${RNFS.CachesDirectoryPath}/omr_cropped_${Date.now()}.jpg`;
+          OpenCV.saveMatToFile(colorCroppedMat, croppedFileName, 'jpeg', 0.8);
+          croppedPath = `file://${croppedFileName}`;
+
+          // Save scored image
+          const scoredFileName = `${RNFS.CachesDirectoryPath}/omr_scored_${Date.now()}.jpg`;
+          OpenCV.saveMatToFile(scoredMat, scoredFileName, 'jpeg', 0.8);
+          scoredPath = `file://${scoredFileName}`;
+
+          // Save sub-columns image
+          const subColsFileName = `${RNFS.CachesDirectoryPath}/omr_subcols_${Date.now()}.jpg`;
+          OpenCV.saveMatToFile(subColsMat, subColsFileName, 'jpeg', 0.8);
+          subColumnsPath = `file://${subColsFileName}`;
+
+          // Save rows image
+          const rowsFileName = `${RNFS.CachesDirectoryPath}/omr_rows_${Date.now()}.jpg`;
+          OpenCV.saveMatToFile(rowsMat, rowsFileName, 'jpeg', 0.8);
+          rowsPath = `file://${rowsFileName}`;
+
+          // Save final scored image
+          const finalFileName = `${RNFS.CachesDirectoryPath}/omr_final_${Date.now()}.jpg`;
+          OpenCV.saveMatToFile(finalScoredMat, finalFileName, 'jpeg', 0.8);
+          finalScoredPath = `file://${finalFileName}`;
         } else {
-           // Improved erasure rejection: 60px gap required to distinguish real from ghost
-           const darkest = markedIdx[0].v;
-           const second  = markedIdx[1].v;
-           if (second - darkest > 60) { 
-              finalAns = OPTION_LETTERS[markedIdx[0].i] || '';
-           } else {
-              finalAns = markedIdx.map(o => OPTION_LETTERS[o.i]).sort().join('');
-           }
-        }
-
-        results[q.questionNumber] = finalAns;
-        
-        const expected = answerKey[q.questionNumber - 1];
-        if (finalAns === '') {
-           // skipped
-        } else if (finalAns === expected) {
-           correct++;
-        } else {
-           incorrect++;
+          console.log(`[OMR] 🚨 Invalid crop dimensions: W=${roiW}, H=${roiH}`);
         }
       }
- 
+
+      // 9. Return images
+      const binaryPath = `${RNFS.CachesDirectoryPath}/omr_binary_${Date.now()}.jpg`;
+      const outlinedPath = `${RNFS.CachesDirectoryPath}/omr_outlined_${Date.now()}.jpg`;
+
+      OpenCV.saveMatToFile(binary, binaryPath, 'jpeg', 0.8);
+      OpenCV.saveMatToFile(drawImg, outlinedPath, 'jpeg', 0.8);
+
       OpenCV.clearBuffers();
+
       return {
-        results,
-        correct,
-        incorrect,
-        skipped,
-        total: config.totalQuestions,
-        score: correct
+        binary: `file://${binaryPath}`,
+        outlined: `file://${outlinedPath}`,
+        cropped: croppedPath,
+        scored: scoredPath,
+        subColumns: subColumnsPath,
+        rows: rowsPath,
+        finalScored: finalScoredPath
       };
     } catch (e) {
+      console.log('[OMR] 🧠 Something went wrong:', e);
       OpenCV.clearBuffers();
       throw e;
     }
