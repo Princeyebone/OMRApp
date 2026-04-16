@@ -14,10 +14,10 @@ import {
   Surface,
   Snackbar,
 } from 'react-native-paper';
-import CameraScanner from '../../components/CameraScanner';
+import DocumentScanner from 'react-native-document-scanner-plugin';
 import { OMRProcessor } from '../../algorithm/omrProcessor';
 
-type AppView = 'home' | 'camera';
+type AppView = 'home';
 
 const HomeScreen = () => {
   const theme = useTheme();
@@ -34,18 +34,9 @@ const HomeScreen = () => {
   const [resultRows, setResultRows] = useState<string | null>(null);
   const [resultFinal, setResultFinal] = useState<string | null>(null);
 
-  React.useEffect(() => {
-    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (view === 'camera') { setView('home'); return true; }
-      return false;
-    });
-    return () => sub.remove();
-  }, [view]);
-
   const showError = (msg: string) => { setErrorMessage(msg); setSnackbarVisible(true); };
 
   const handleCapture = useCallback(async (photoUri: string) => {
-    setView('home');
     setLoading(true);
     setResultBinary(null);
     setResultOutlined(null);
@@ -66,12 +57,27 @@ const HomeScreen = () => {
       setResultRows(processed.rows);
       setResultFinal(processed.finalScored);
     } catch (err: any) {
-      console.error('[OMR Error]', err);
-      showError(err?.message ?? 'An error occurred during processing.');
+      console.error('[OMR ERROR LOG]', err);
+      showError('Analysis failed. Please ensure the sheet is well-lit, flat, and the alignment marks are visible.');
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const handleScan = async () => {
+    try {
+      const { scannedImages } = await DocumentScanner.scanDocument({
+        maxNumDocuments: 1,
+      });
+
+      if (scannedImages && scannedImages.length > 0) {
+        handleCapture(scannedImages[0]);
+      }
+    } catch (err: any) {
+      console.error('[Scanner Error]', err);
+      showError('Failed to open the document scanner.');
+    }
+  };
 
   const handleUpload = async () => {
     const result = await launchImageLibrary({ 
@@ -86,22 +92,13 @@ const HomeScreen = () => {
     }
   };
 
-  if (view === 'camera') {
-    return (
-      <CameraScanner
-        onCapture={handleCapture}
-        onCancel={() => setView('home')}
-      />
-    );
-  }
-
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <ScrollView contentContainerStyle={styles.scrollContainer} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <Text variant="displaySmall" style={[styles.title, { color: theme.colors.primary }]}>OMR V2</Text>
           <Text variant="titleMedium" style={{ color: theme.colors.outline, marginTop: 4 }}>
-            Step-by-step processing test
+            Native Document Scanner Integration
           </Text>
         </View>
 
@@ -114,7 +111,7 @@ const HomeScreen = () => {
             <Button
               mode="contained"
               icon="camera"
-              onPress={() => setView('camera')}
+              onPress={handleScan}
               loading={loading}
               disabled={loading}
               style={styles.mainButton}
