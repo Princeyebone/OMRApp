@@ -114,10 +114,8 @@ export class OMRProcessor {
       const rectCandidates = boundingBoxes.filter(b => b.w >= 8 && b.h >= 5 && b.w < 150 && b.h < 150); 
       console.log(`[OMR] 🧠 ${rectCandidates.length} tracking blocks remaining after destroying noise sand.`);
 
-      // 5. Skip drawing all rectCandidates to keep Step 2 exclusively for the colored Left/Right timing tracks!
-
-      // 6. Group by X position
-      const xTolerance = 60; // Significantly increased to handle scanner diagonal skewing on long 1200px images!
+      // 5. Skip drawing all rectCandidates to keep Step 2 exclusively for the colored Left/Right timing      // 6. Group by TIGHT X position to prevent horizontal overlap with bubbles!
+      const xTolerance = 12; // Extremely tight: Impossible for bubbles to bridge into the track group!
       const groups: { centerX: number; items: typeof rectCandidates }[] = [];
 
       for (const box of rectCandidates) {
@@ -136,43 +134,47 @@ export class OMRProcessor {
         }
       }
 
-      // 7. Count rectangles per group & print
-      groups.sort((a, b) => b.items.length - a.items.length);
-      console.log(`[OMR] 🧠 Found ${groups.length} X-coordinate groups`);
+      // 7. Count rectangles per group & sort dynamically Left to Right
+      const validTracks = groups.filter(g => g.items.length >= 6); // Accept smaller clusters in case of skew-splintering
+      validTracks.sort((a, b) => a.centerX - b.centerX);
 
-      for (let i = 0; i < Math.min(5, groups.length); i++) {
-        console.log(`[OMR] 🧠 Group ${i + 1} | X: ${Math.round(groups[i].centerX)} | Count: ${groups[i].items.length}`);
+      // 8. Find the outermost Left and Right clusters
+      const primaryLeft = validTracks[0];
+      const primaryRight = validTracks[validTracks.length - 1];
+
+      // To handle diagonal page skews (which split the track into adjacent splinters under a tight xTolerance),
+      // we aggregate any splinters that are intimately close to the primary anchors!
+      const leftTrackItems = primaryLeft ? validTracks.filter(g => Math.abs(g.centerX - primaryLeft.centerX) <= 35).flatMap(g => g.items) : [];
+      const rightTrackItems = primaryRight ? validTracks.filter(g => Math.abs(g.centerX - primaryRight.centerX) <= 35).flatMap(g => g.items) : [];
+
+      if (!primaryLeft || !primaryRight || leftTrackItems.length === 0 || rightTrackItems.length === 0) {
+        console.log('[OMR] 🧠 tracks not detected (missing left or right tracking columns)');
       }
 
-      // 7-B. SECURELY IDENTIFY LEFT AND RIGHT TRACKS
-      // Instead of just relying on the highest counts (which might pick a column of shaded bubbles),
-      // we filter for columns with >=15 items, then securely pick the absolute Leftmost and Rightmost columns!
-      let topGroups: typeof groups = [];
-      const validTracks = groups.filter(g => g.items.length >= 15);
-      validTracks.sort((a, b) => a.centerX - b.centerX); // Sort dynamically Left to Right
-
-      if (validTracks.length >= 2) {
-        topGroups = [validTracks[0], validTracks[validTracks.length - 1]];
-      } else {
-        console.log('[OMR] 🧠 tracks not detected (could not find two outermost tracking columns)');
+      // Highlight the aggregated tracking marks safely
+      for (const box of leftTrackItems) {
+         const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
+         const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
+         const color = OpenCV.createObject(ObjectType.Scalar, 0, 0, 255, 255); // Red
+         OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, -1, LineTypes.LINE_8);
+      }
+      for (const box of rightTrackItems) {
+         const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
+         const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
+         const color = OpenCV.createObject(ObjectType.Scalar, 255, 0, 0, 255); // Blue
+         OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, -1, LineTypes.LINE_8);
       }
 
-      // Highlight the rectangles in the top 2 groups
-      if (topGroups.length > 0) {
-        for (const box of topGroups[0].items) {
-          const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
-          const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
-          const color = OpenCV.createObject(ObjectType.Scalar, 0, 0, 255, 255); // Red
-          OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, -1, LineTypes.LINE_8);
-        }
-      }
-      if (topGroups.length > 1) {
-        for (const box of topGroups[1].items) {
-          const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
-          const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
-          const color = OpenCV.createObject(ObjectType.Scalar, 255, 0, 0, 255); // Blue
-          OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, -1, LineTypes.LINE_8);
-        }
+      // 9. Crop Area using inner boundaries
+      let roiX = 0, roiY = 0, roiW = mCols, roiH = mRows;
+      let isCropped = false;
+
+      if (leftTrackItems.length > 0 && rightTrackItems.length > 0) {
+        // Inner edge of left track = absolute max(box.x + box.w)
+        const leftEdge = Math.max(...leftTrackItems.map(b => b.x + b.w));
+
+        // Inner edge of right track = absolute min(box.x)
+        const rightEdge = Math.min(...rightTrackItems.map(b => b.x)); }
       }
 
       let croppedPath: string | null = null;
@@ -287,24 +289,31 @@ export class OMRProcessor {
              return {x: minX, y: minY, w: maxX - minX, h: maxY - minY};
           }).filter(Boolean) as {x: number, y: number, w: number, h: number}[];
 
-          // 1. Filter out raw dust
-          const validElements = safeInternalBoxes.filter(b => b.w > 8 && b.h > 8);
+          // 1. Filter out raw dust AND page-wide universal bridges (like long title underlines)
+          const validElements = safeInternalBoxes.filter(b => b.w > 8 && b.h > 8 && b.w < (cCols * 0.6) && b.h < (cRows * 0.8));
 
-          // 2. Cluster into Vertical Semantic Columns
-          // If elements overlap horizontally (or are within 5 pixels), they belong to the same Column Block.
+          // 2. 2D Proximity Semantic Sectioning
+          // If elements are physically close vertically AND horizontally, they naturally belong to the same block.
           let columnBoxes: {x: number, y: number, w: number, h: number}[] = [];
           
           for (const box of validElements) {
              let foundGroup = false;
              for (let mb of columnBoxes) {
                 const boxRight = box.x + box.w;
+                const boxBottom = box.y + box.h;
                 const mbRight = mb.x + mb.w;
+                const mbBottom = mb.y + mb.h;
                 
-                if ((box.x <= mbRight + 5) && (boxRight >= mb.x - 5)) {
+                // hClose = 40 pixels (bridges A, B, C, D but stops at Column gaps)
+                // vClose = 60 pixels (bridges rows going downwards)
+                const hClose = (box.x <= mbRight + 40) && (boxRight >= mb.x - 40);
+                const vClose = (box.y <= mbBottom + 60) && (boxBottom >= mb.y - 60);
+
+                if (hClose && vClose) {
                    mb.x = Math.min(mb.x, box.x);
                    mb.y = Math.min(mb.y, box.y);
                    mb.w = Math.max(mbRight, boxRight) - mb.x;
-                   mb.h = Math.max(mb.y + mb.h, box.y + box.h) - mb.y;
+                   mb.h = Math.max(mbBottom, boxBottom) - mb.y;
                    foundGroup = true;
                    break;
                 }
@@ -323,12 +332,18 @@ export class OMRProcessor {
                    const a = columnBoxes[i];
                    const b = columnBoxes[j];
                    const aR = a.x + a.w;
+                   const aB = a.y + a.h;
                    const bR = b.x + b.w;
-                   if ((a.x <= bR + 5) && (aR >= b.x - 5)) {
+                   const bB = b.y + b.h;
+
+                   const hClose = (a.x <= bR + 40) && (aR >= b.x - 40);
+                   const vClose = (a.y <= bB + 60) && (aB >= b.y - 60);
+
+                   if (hClose && vClose) {
                       a.x = Math.min(a.x, b.x);
                       a.y = Math.min(a.y, b.y);
                       a.w = Math.max(aR, bR) - a.x;
-                      a.h = Math.max(a.y + a.h, b.y + b.h) - a.y;
+                      a.h = Math.max(aB, bB) - a.y;
                       columnBoxes.splice(j, 1);
                       merging = true;
                       break;
@@ -338,10 +353,11 @@ export class OMRProcessor {
              }
           }
           
-          columnBoxes.sort((a,b) => a.x - b.x); // Left to right
+          // Sort by Top to Bottom, then Left to Right
+          columnBoxes.sort((a,b) => (a.y * 1000 + a.x) - (b.y * 1000 + b.x));
 
-          // Drop noise clusters holding minimal vertical height
-          columnBoxes = columnBoxes.filter(b => b.h > (cRows * 0.3));
+          // Drop noise clusters
+          columnBoxes = columnBoxes.filter(b => b.h > 40 && b.w > 40);
 
           console.log(`[OMR] 🧠 Dynamically Clustered ${validElements.length} internal elements into ${columnBoxes.length} Major Semantic Boxes!`);
 
