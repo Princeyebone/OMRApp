@@ -9,38 +9,64 @@ import {
   RetrievalModes,
   ContourApproximationModes,
   LineTypes,
+  MorphTypes,
+  MorphShapes,
+  NormTypes,
+  InterpolationFlags,
 } from 'react-native-fast-opencv';
 
 export class OMRProcessor {
-  static async processImage(imagePath: string): Promise<{ binary: string, outlined: string, cropped: string | null, scored: string | null, subColumns: string | null, rows: string | null, finalScored: string | null }> {
+  static async processImage(imagePath: string): Promise<{ binary: string, outlined: string, cropped: string | null, majorBoxes: string | null, scored: string | null, subColumns: string | null, rows: string | null, finalScored: string | null }> {
     try {
       const b64 = await RNFS.readFile(imagePath, 'base64');
       const imgMat = OpenCV.base64ToMat(b64);
 
-      let gray = imgMat;
-      const info = OpenCV.toJSValue(imgMat) as Record<string, any>;
+      const rawInfo = OpenCV.toJSValue(imgMat) as any;
+      const rawCols = rawInfo.cols || 2480;
+      const rawRows = rawInfo.rows || 3508;
+
+      // 1-0. Force Standard Processing Resolution (1200px width)
+      const targetWidth = 1200;
+      const targetHeight = Math.round((targetWidth / rawCols) * rawRows);
+      
+      const resizedMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+      OpenCV.invoke('resize', imgMat, resizedMat, OpenCV.createObject(ObjectType.Size, targetWidth, targetHeight), 0, 0, InterpolationFlags.INTER_LINEAR);
+
+      let gray = resizedMat;
+      const info = OpenCV.toJSValue(resizedMat) as Record<string, any>;
       const channels = (info.type >> 3) + 1;
+      const mCols = info.cols || targetWidth;
+      const mRows = info.rows || targetHeight;
 
       if (channels > 1) {
         gray = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
         if (channels === 3) {
-          OpenCV.invoke('cvtColor', imgMat, gray, ColorConversionCodes.COLOR_BGR2GRAY);
+          OpenCV.invoke('cvtColor', resizedMat, gray, ColorConversionCodes.COLOR_BGR2GRAY);
         } else {
-          OpenCV.invoke('cvtColor', imgMat, gray, ColorConversionCodes.COLOR_RGBA2GRAY);
+          OpenCV.invoke('cvtColor', resizedMat, gray, ColorConversionCodes.COLOR_RGBA2GRAY);
         }
       }
 
-      // 1. Adaptive Threshold (Inverse) to get white items on black background
-      const binary = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+      // 1-A. Normalization & Blur
+      // Removed heavy Gaussian Blur as it distorts thin lines and bubbles.
+      // Light thresholding preserves crisp column borders while size filters remove the sand!
+
+      // 1-B. Crisp Adaptive Threshold (Inverse)
+      const thresh = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
       OpenCV.invoke('adaptiveThreshold',
         gray,
-        binary,
+        thresh,
         255,
         AdaptiveThresholdTypes.ADAPTIVE_THRESH_GAUSSIAN_C,
         ThresholdTypes.THRESH_BINARY_INV,
-        31,
-        15
+        35, // Larger block size captures wider light context
+        13  // Stronger bias completely stops thick lines and crushes shadow noise
       );
+
+      // 1-C. Skip Morphology
+      // No morphology here! The 'thick bubbles' were caused by MORPH_CLOSE fusing the inner gaps. 
+      // Sticking strictly to crisp adaptive thresholding preserves thin bubble borders!
+      const binary = thresh; // Pass directly to next step
 
       // We need a color version to draw green rectangles so they are easily visible
       const drawImg = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
@@ -83,20 +109,15 @@ export class OMRProcessor {
         console.log('[OMR] 🚨 PARSE ERROR: jsContours[0] looks like:', JSON.stringify(jsContours[0]));
       }
 
-      // 4. Draw ALL boxes to see exactly what we caught!
-      for (const box of boundingBoxes) {
-        const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
-        const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
-        const color = OpenCV.createObject(ObjectType.Scalar, 0, 255, 0, 255); // BGR
-        OpenCV.invoke('rectangle', drawImg, pt1, pt2, color, 4, LineTypes.LINE_8);
-      }
+      // 4. Filter into rectangle candidates (moderate filter for 1200px width)
+      // Timing tracks on 1200px are ~25px by ~10px. This allows them through but dumps sand.
+      const rectCandidates = boundingBoxes.filter(b => b.w >= 8 && b.h >= 5 && b.w < 150 && b.h < 150); 
+      console.log(`[OMR] 🧠 ${rectCandidates.length} tracking blocks remaining after destroying noise sand.`);
 
-      // 5. Filter into rectangle candidates (generous filter)
-      const rectCandidates = boundingBoxes.filter(b => b.w > 5 && b.h > 5); // Just discard tiny noise 
-      console.log(`[OMR] 🧠 ${rectCandidates.length} potential tracking blocks after size filter.`);
+      // 5. Skip drawing all rectCandidates to keep Step 2 exclusively for the colored Left/Right timing tracks!
 
       // 6. Group by X position
-      const xTolerance = 25; // Giving more room for slightly skewed tracks
+      const xTolerance = 60; // Significantly increased to handle scanner diagonal skewing on long 1200px images!
       const groups: { centerX: number; items: typeof rectCandidates }[] = [];
 
       for (const box of rectCandidates) {
@@ -119,13 +140,21 @@ export class OMRProcessor {
       groups.sort((a, b) => b.items.length - a.items.length);
       console.log(`[OMR] 🧠 Found ${groups.length} X-coordinate groups`);
 
-      const topGroups = groups.slice(0, Math.min(5, groups.length)); // Print top 5
-      for (let i = 0; i < topGroups.length; i++) {
-        console.log(`[OMR] 🧠 Group ${i + 1} | X: ${Math.round(topGroups[i].centerX)} | Count: ${topGroups[i].items.length}`);
+      for (let i = 0; i < Math.min(5, groups.length); i++) {
+        console.log(`[OMR] 🧠 Group ${i + 1} | X: ${Math.round(groups[i].centerX)} | Count: ${groups[i].items.length}`);
       }
 
-      if (groups.length === 0 || groups[0].items.length < 5) {
-        console.log('[OMR] 🧠 tracks not detected (highest count in a column is too low)');
+      // 7-B. SECURELY IDENTIFY LEFT AND RIGHT TRACKS
+      // Instead of just relying on the highest counts (which might pick a column of shaded bubbles),
+      // we filter for columns with >=15 items, then securely pick the absolute Leftmost and Rightmost columns!
+      let topGroups: typeof groups = [];
+      const validTracks = groups.filter(g => g.items.length >= 15);
+      validTracks.sort((a, b) => a.centerX - b.centerX); // Sort dynamically Left to Right
+
+      if (validTracks.length >= 2) {
+        topGroups = [validTracks[0], validTracks[validTracks.length - 1]];
+      } else {
+        console.log('[OMR] 🧠 tracks not detected (could not find two outermost tracking columns)');
       }
 
       // Highlight the rectangles in the top 2 groups
@@ -147,6 +176,7 @@ export class OMRProcessor {
       }
 
       let croppedPath: string | null = null;
+      let majorBoxesPath: string | null = null;
       let scoredPath: string | null = null;
       let subColumnsPath: string | null = null;
       let rowsPath: string | null = null;
@@ -187,10 +217,16 @@ export class OMRProcessor {
         // Positive number extends the line downwards. Negative shrinks it upwards.
         const bottomPadding = 7;
 
-        const roiX = leftEdge + leftTrim;
-        const roiY = topEdge + topTrim;
-        const roiW = rightEdge - roiX;
-        const roiH = (bottomEdge + bottomPadding) - roiY;
+        let roiX = leftEdge + leftTrim;
+        let roiY = topEdge + topTrim;
+        let roiW = rightEdge - roiX;
+        let roiH = (bottomEdge + bottomPadding) - roiY;
+
+        // 8-B. CLAMP ROI TO IMAGE BOUNDARIES (Prevents OpenCV Assertion Crashes)
+        roiX = Math.max(0, roiX);
+        roiY = Math.max(0, roiY);
+        if (roiX + roiW > mCols) roiW = mCols - roiX;
+        if (roiY + roiH > mRows) roiH = mRows - roiY;
 
         if (roiW > 0 && roiH > 0) {
           console.log(`[OMR] 🧠 Initial Timing Track ROI: X=${roiX}, Y=${roiY}, W=${roiW}, H=${roiH}`);
@@ -198,36 +234,126 @@ export class OMRProcessor {
           const croppedMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
           OpenCV.invoke('crop', binary, croppedMat, roiRect);
 
+          // Fetch cropped info securely to prevent downstream cell crashes
+          const cInfo = OpenCV.toJSValue(croppedMat) as Record<string, any>;
+          const cCols = cInfo.cols;
+          const cRows = cInfo.rows;
+
           // The 3rd image is now the pristine cropped answer area
           const colorCroppedMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
           OpenCV.invoke('cvtColor', croppedMat, colorCroppedMat, ColorConversionCodes.COLOR_GRAY2BGR);
 
-          // The 4th image receives the scored reticles
+          // The 4th image is dedicated strictly to Semantic Region (Major Box) Detection
+          const majorMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
+          OpenCV.invoke('cvtColor', croppedMat, majorMat, ColorConversionCodes.COLOR_GRAY2BGR);
+
+          // The 5th image receives the scored reticles
           const scoredMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
           OpenCV.invoke('cvtColor', croppedMat, scoredMat, ColorConversionCodes.COLOR_GRAY2BGR);
 
-          // The 5th image receives the sub-column (inner) splits
+          // The 6th image receives the sub-column (inner) splits
           const subColsMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
           OpenCV.invoke('cvtColor', croppedMat, subColsMat, ColorConversionCodes.COLOR_GRAY2BGR);
 
-          // The 6th image receives the final row splits
+          // The 7th image receives the final row splits
           const rowsMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
           OpenCV.invoke('cvtColor', croppedMat, rowsMat, ColorConversionCodes.COLOR_GRAY2BGR);
 
-          // The 7th image receives the final detected bubbles highlighted
+          // The 8th image receives the final detected bubbles highlighted
           const finalScoredMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
           OpenCV.invoke('cvtColor', croppedMat, finalScoredMat, ColorConversionCodes.COLOR_GRAY2BGR);
 
-          // Mathematical column splitting (Physical Layout Model)
-          const numCols = 5;
+          // ------------------------------------------------------------------------
+          // STRATEGY: DYNAMIC MACRO CLUSTERING (Melt & Scan Concept)
+          // Since the sheet columns aren't enclosed by printed ink boxes, we scan all elements (bubbles, text)
+          // and physically cluster them into Macro Columns based on horizontal alignment!
+          // ------------------------------------------------------------------------
+          const internalContoursMat = OpenCV.createObject(ObjectType.PointVectorOfVectors);
+          OpenCV.invoke('findContours', croppedMat, internalContoursMat, RetrievalModes.RETR_EXTERNAL, ContourApproximationModes.CHAIN_APPROX_SIMPLE);
+          
+          const innerJsValue = OpenCV.toJSValue(internalContoursMat) as any;
+          const innerContoursValues: {x: number, y: number}[][] = innerJsValue && innerJsValue.array ? innerJsValue.array : [];
 
-          // TWEAK THESE 3 VARIABLES FOR MAIN COLUMNS:
-          const leftMargin = 21;  // Pixels of white margin on the far left (before Col 1)
-          const rightMargin = 22; // Pixels of white margin on the far right (after Col 5)
-          const gapWidth = 15;    // Pixels of empty gap between Columns
+          const safeInternalBoxes = innerContoursValues.map((pts) => {
+             let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+             if (!pts) return null;
+             for (const p of pts) {
+               if (p.x < minX) minX = p.x;
+               if (p.y < minY) minY = p.y;
+               if (p.x > maxX) maxX = p.x;
+               if (p.y > maxY) maxY = p.y;
+             }
+             if (minX === Infinity || maxX === -Infinity) return null;
+             return {x: minX, y: minY, w: maxX - minX, h: maxY - minY};
+          }).filter(Boolean) as {x: number, y: number, w: number, h: number}[];
 
-          // Total Width = leftMargin + (5 * colWidth) + (4 * gapWidth) + rightMargin
-          const colWidth = (roiW - leftMargin - rightMargin - ((numCols - 1) * gapWidth)) / numCols;
+          // 1. Filter out raw dust
+          const validElements = safeInternalBoxes.filter(b => b.w > 8 && b.h > 8);
+
+          // 2. Cluster into Vertical Semantic Columns
+          // If elements overlap horizontally (or are within 5 pixels), they belong to the same Column Block.
+          let columnBoxes: {x: number, y: number, w: number, h: number}[] = [];
+          
+          for (const box of validElements) {
+             let foundGroup = false;
+             for (let mb of columnBoxes) {
+                const boxRight = box.x + box.w;
+                const mbRight = mb.x + mb.w;
+                
+                if ((box.x <= mbRight + 5) && (boxRight >= mb.x - 5)) {
+                   mb.x = Math.min(mb.x, box.x);
+                   mb.y = Math.min(mb.y, box.y);
+                   mb.w = Math.max(mbRight, boxRight) - mb.x;
+                   mb.h = Math.max(mb.y + mb.h, box.y + box.h) - mb.y;
+                   foundGroup = true;
+                   break;
+                }
+             }
+             if (!foundGroup) {
+                columnBoxes.push({ ...box });
+             }
+          }
+
+          // 3. Resolve expansion overlaps
+          let merging = true;
+          while (merging) {
+             merging = false;
+             for (let i = 0; i < columnBoxes.length; i++) {
+                for (let j = i + 1; j < columnBoxes.length; j++) {
+                   const a = columnBoxes[i];
+                   const b = columnBoxes[j];
+                   const aR = a.x + a.w;
+                   const bR = b.x + b.w;
+                   if ((a.x <= bR + 5) && (aR >= b.x - 5)) {
+                      a.x = Math.min(a.x, b.x);
+                      a.y = Math.min(a.y, b.y);
+                      a.w = Math.max(aR, bR) - a.x;
+                      a.h = Math.max(a.y + a.h, b.y + b.h) - a.y;
+                      columnBoxes.splice(j, 1);
+                      merging = true;
+                      break;
+                   }
+                }
+                if (merging) break;
+             }
+          }
+          
+          columnBoxes.sort((a,b) => a.x - b.x); // Left to right
+
+          // Drop noise clusters holding minimal vertical height
+          columnBoxes = columnBoxes.filter(b => b.h > (cRows * 0.3));
+
+          console.log(`[OMR] 🧠 Dynamically Clustered ${validElements.length} internal elements into ${columnBoxes.length} Major Semantic Boxes!`);
+
+          // Draw Semantic Region Boundaries onto the majorMat
+          for (const box of columnBoxes) {
+              const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
+              const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
+              const color = OpenCV.createObject(ObjectType.Scalar, 0, 255, 0, 255); // Green mapping
+              OpenCV.invoke('rectangle', majorMat, pt1, pt2, color, 4, LineTypes.LINE_8);
+          }
+
+          const numCols = columnBoxes.length > 0 ? columnBoxes.length : 5; 
 
           // TWEAK THESE VARIABLES FOR INNER SUB-COLUMNS:
           // The Q column starts at the edge of the main column. You define its width.
@@ -241,11 +367,30 @@ export class OMRProcessor {
           // Exclusively draw the bounds of the 5 Columns on the 4th Image
           // and the inner sub-columns on the 5th Image.
           for (let c = 0; c < numCols; c++) {
-            const startX = Math.round(leftMargin + (c * (colWidth + gapWidth)));
+            let startX, colWidth, colStartY, colHeight;
+
+            if (columnBoxes.length === numCols) {
+                // Dynamically use the found major box!
+                startX = columnBoxes[c].x;
+                colWidth = columnBoxes[c].w;
+                colStartY = columnBoxes[c].y;
+                colHeight = columnBoxes[c].h;
+            } else {
+                // Fallback geometry if dynamic boxes were not found appropriately
+                const leftMargin = 21; 
+                const rightMargin = 22;
+                const gapWidth = 15;
+                const mathColWidth = (cCols - leftMargin - rightMargin - ((5 - 1) * gapWidth)) / 5;
+                startX = Math.round(leftMargin + (c * (mathColWidth + gapWidth)));
+                colWidth = mathColWidth;
+                colStartY = 0;
+                colHeight = cRows;
+            }
+
             const endX = Math.round(startX + colWidth);
 
-            const pt1 = OpenCV.createObject(ObjectType.Point, startX, 0);
-            const pt2 = OpenCV.createObject(ObjectType.Point, endX, roiH);
+            const pt1 = OpenCV.createObject(ObjectType.Point, startX, colStartY);
+            const pt2 = OpenCV.createObject(ObjectType.Point, endX, colStartY + colHeight);
 
             const colColor = OpenCV.createObject(ObjectType.Scalar, 255, 0, 0, 255); // Blue
             OpenCV.invoke('rectangle', scoredMat, pt1, pt2, colColor, 3, LineTypes.LINE_8);
@@ -256,8 +401,8 @@ export class OMRProcessor {
             // 1. Draw Q Column
             const qStartX = startX + qStartOffset;
             const qEndX = qStartX + qWidth;
-            const qPt1 = OpenCV.createObject(ObjectType.Point, Math.round(qStartX), 0);
-            const qPt2 = OpenCV.createObject(ObjectType.Point, Math.round(qEndX), roiH);
+            const qPt1 = OpenCV.createObject(ObjectType.Point, Math.round(qStartX), colStartY);
+            const qPt2 = OpenCV.createObject(ObjectType.Point, Math.round(qEndX), colStartY + colHeight);
             const qColor = OpenCV.createObject(ObjectType.Scalar, 0, 255, 255, 255); // Yellow for Q
             OpenCV.invoke('rectangle', subColsMat, qPt1, qPt2, qColor, 2, LineTypes.LINE_8);
 
@@ -273,8 +418,8 @@ export class OMRProcessor {
               const oStartX = startX + optionsStartOffset + (opt * singleOptionWidth);
               const oEndX = oStartX + singleOptionWidth;
 
-              const oPt1 = OpenCV.createObject(ObjectType.Point, Math.round(oStartX), 0);
-              const oPt2 = OpenCV.createObject(ObjectType.Point, Math.round(oEndX), roiH);
+              const oPt1 = OpenCV.createObject(ObjectType.Point, Math.round(oStartX), colStartY);
+              const oPt2 = OpenCV.createObject(ObjectType.Point, Math.round(oEndX), colStartY + colHeight);
               OpenCV.invoke('rectangle', subColsMat, oPt1, oPt2, optColor, 2, LineTypes.LINE_8);
             }
           }
@@ -299,12 +444,31 @@ export class OMRProcessor {
           const padding = 2; // Shave off border grid lines
 
           for (let c = 0; c < numCols; c++) {
-            const startX = Math.round(leftMargin + (c * (colWidth + gapWidth)));
+            let startX, colWidth, colStartY, colHeight;
+            if (columnBoxes.length === numCols) {
+                startX = columnBoxes[c].x;
+                colWidth = columnBoxes[c].w;
+                colStartY = columnBoxes[c].y;
+                colHeight = columnBoxes[c].h;
+            } else {
+                const leftMargin = 21; 
+                const rightMargin = 22;
+                const gapWidth = 15;
+                const mathColWidth = (cCols - leftMargin - rightMargin - ((5 - 1) * gapWidth)) / 5;
+                startX = Math.round(leftMargin + (c * (mathColWidth + gapWidth)));
+                colWidth = mathColWidth;
+                colStartY = 0;
+                colHeight = cRows;
+            }
+
             const optionSpace = colWidth - optionsStartOffset;
             const singleOptionWidth = optionSpace / 4;
 
+            // Update rowHeight to use the dynamically found column height!
+            const rowHeight = colHeight / numRows;
+
             for (let r = 0; r < numRows; r++) {
-               const rowY = Math.round(r * rowHeight);
+               const rowY = Math.round(colStartY + (r * rowHeight));
 
                let bestOpt = -1;
                let bestScore = -1;
@@ -313,10 +477,19 @@ export class OMRProcessor {
                for (let opt = 0; opt < 4; opt++) {
                   const bubbleX = startX + optionsStartOffset + (opt * singleOptionWidth);
                   
-                  const safeX = Math.round(bubbleX + padding);
-                  const safeY = Math.round(rowY + padding);
-                  const safeW = Math.round(singleOptionWidth - (2 * padding));
-                  const safeH = Math.round(rowHeight - (2 * padding));
+                  let safeX = Math.round(bubbleX + padding);
+                  let safeY = Math.round(rowY + padding);
+                  let safeW = Math.round(singleOptionWidth - (2 * padding));
+                  let safeH = Math.round(rowHeight - (2 * padding));
+
+                  // SECURE CLAMPING: Prevents cell rounding errors from violating matrix bounds
+                  safeX = Math.max(0, safeX);
+                  safeY = Math.max(0, safeY);
+                  if (safeX + safeW > cCols) safeW = cCols - safeX;
+                  if (safeY + safeH > cRows) safeH = cRows - safeY;
+
+                  // Safety skip if dimensions collapsed entirely
+                  if (safeW <= 0 || safeH <= 0) continue;
 
                   const cellRect = OpenCV.createObject(ObjectType.Rect, safeX, safeY, safeW, safeH);
                   const cellMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
@@ -353,6 +526,11 @@ export class OMRProcessor {
           const croppedFileName = `${RNFS.CachesDirectoryPath}/omr_cropped_${Date.now()}.jpg`;
           OpenCV.saveMatToFile(colorCroppedMat, croppedFileName, 'jpeg', 0.8);
           croppedPath = `file://${croppedFileName}`;
+
+          // Save major boxes image
+          const majorBoxesFileName = `${RNFS.CachesDirectoryPath}/omr_major_${Date.now()}.jpg`;
+          OpenCV.saveMatToFile(majorMat, majorBoxesFileName, 'jpeg', 0.8);
+          majorBoxesPath = `file://${majorBoxesFileName}`;
 
           // Save scored image
           const scoredFileName = `${RNFS.CachesDirectoryPath}/omr_scored_${Date.now()}.jpg`;
@@ -391,6 +569,7 @@ export class OMRProcessor {
         binary: `file://${binaryPath}`,
         outlined: `file://${outlinedPath}`,
         cropped: croppedPath,
+        majorBoxes: majorBoxesPath,
         scored: scoredPath,
         subColumns: subColumnsPath,
         rows: rowsPath,

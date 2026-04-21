@@ -29,6 +29,7 @@ const HomeScreen = () => {
   const [resultBinary, setResultBinary] = useState<string | null>(null);
   const [resultOutlined, setResultOutlined] = useState<string | null>(null);
   const [resultCropped, setResultCropped] = useState<string | null>(null);
+  const [resultMajorBoxes, setResultMajorBoxes] = useState<string | null>(null);
   const [resultScored, setResultScored] = useState<string | null>(null);
   const [resultSubColumns, setResultSubColumns] = useState<string | null>(null);
   const [resultRows, setResultRows] = useState<string | null>(null);
@@ -41,6 +42,7 @@ const HomeScreen = () => {
     setResultBinary(null);
     setResultOutlined(null);
     setResultCropped(null);
+    setResultMajorBoxes(null);
     setResultScored(null);
     setResultSubColumns(null);
     setResultRows(null);
@@ -52,6 +54,7 @@ const HomeScreen = () => {
       setResultBinary(processed.binary);
       setResultOutlined(processed.outlined);
       setResultCropped(processed.cropped);
+      setResultMajorBoxes(processed.majorBoxes);
       setResultScored(processed.scored);
       setResultSubColumns(processed.subColumns);
       setResultRows(processed.rows);
@@ -68,6 +71,8 @@ const HomeScreen = () => {
     try {
       const { scannedImages } = await DocumentScanner.scanDocument({
         maxNumDocuments: 1,
+        croppedImageQuality: 100,
+        responseType: 'imageFilePath' as any,
       });
 
       if (scannedImages && scannedImages.length > 0) {
@@ -167,9 +172,19 @@ const HomeScreen = () => {
           </View>
         )}
 
+        {resultMajorBoxes && (
+          <View style={styles.resultContainer}>
+            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: 'magenta' }}>STEP 4: Semantic Macro Blocks (Clustering)</Text>
+            <Image 
+               source={{ uri: resultMajorBoxes }} 
+               style={{ width: '100%', height: 350, borderRadius: 12, resizeMode: 'contain', backgroundColor: '#eef' }} 
+            />
+          </View>
+        )}
+
         {resultScored && (
           <View style={styles.resultContainer}>
-            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: 'blue' }}>STEP 4: Main Columns</Text>
+            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: 'blue' }}>STEP 5: Main Columns</Text>
             <Image 
                source={{ uri: resultScored }} 
                style={{ width: '100%', height: 350, borderRadius: 12, resizeMode: 'contain', backgroundColor: '#eef' }} 
@@ -179,7 +194,7 @@ const HomeScreen = () => {
 
         {resultSubColumns && (
           <View style={styles.resultContainer}>
-            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: '#ff00ff' }}>STEP 5: Inner Sub-Columns (Q, A, B, C, D)</Text>
+            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: '#ff00ff' }}>STEP 6: Inner Sub-Columns (Q, A, B, C, D)</Text>
             <Image 
                source={{ uri: resultSubColumns }} 
                style={{ width: '100%', height: 350, borderRadius: 12, resizeMode: 'contain', backgroundColor: '#eef' }} 
@@ -189,7 +204,7 @@ const HomeScreen = () => {
 
         {resultRows && (
           <View style={styles.resultContainer}>
-            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: '#FF8C00' }}>STEP 6: Extracted Rows</Text>
+            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: '#FF8C00' }}>STEP 7: Extracted Rows</Text>
             <Image 
                source={{ uri: resultRows }} 
                style={{ width: '100%', height: 350, borderRadius: 12, resizeMode: 'contain', backgroundColor: '#eef' }} 
@@ -199,7 +214,7 @@ const HomeScreen = () => {
 
         {resultFinal && (
           <View style={styles.resultContainer}>
-            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: 'green' }}>STEP 7: Final Marked Answers</Text>
+            <Text variant="titleMedium" style={{ fontWeight: 'bold', marginBottom: 8, marginTop: 12, color: 'red' }}>STEP 8: Scored Readout!</Text>
             <Image 
                source={{ uri: resultFinal }} 
                style={{ width: '100%', height: 350, borderRadius: 12, resizeMode: 'contain', backgroundColor: '#eef' }} 
