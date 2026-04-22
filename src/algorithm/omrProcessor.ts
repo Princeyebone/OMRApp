@@ -397,33 +397,64 @@ export class OMRProcessor {
           const optionsStartOffset = 28;
           const qWidth = 25;
 
-          // Main Column Splits (Step 5/6)
-          for (let c = 0; c < numCols; c++) {
-            let startX, colWidth, colStartY, colHeight;
-            if (answerColumns.length === numCols) {
-              startX = answerColumns[c].x;
-              colWidth = answerColumns[c].w;
-              colStartY = answerColumns[c].y;
-              colHeight = answerColumns[c].h;
-            } else {
-              const mathColWidth = (cCols - 58) / 5;
-              startX = 21 + (c * (mathColWidth + 15));
-              colWidth = mathColWidth;
-              colStartY = 0;
-              colHeight = cRows;
-            }
-            const pt1 = OpenCV.createObject(ObjectType.Point, startX, colStartY);
-            const pt2 = OpenCV.createObject(ObjectType.Point, startX + colWidth, colStartY + colHeight);
-            OpenCV.invoke('rectangle', scoredMat, pt1, pt2, OpenCV.createObject(ObjectType.Scalar, 255, 0, 0, 255), 3, LineTypes.LINE_8);
+          // --- Step 5: Identify Top-5 Major Heights (noise-tolerant) ---
+          // Problem: a small noise line attached to one column inflates its H slightly,
+          // causing a naive height sort to misjudge which 5 are truly "the same height".
+          //
+          // Solution:
+          //   1. Filter out the page frame (W >= 70% of sheet width).
+          //   2. Among remaining tall candidates (H > 30% of sheet), find the tallest
+          //      one and use its height as a reference.
+          //   3. Accept every candidate whose H is within ±10% of that reference
+          //      (max 60px tolerance) — all genuinely same-height columns pass through.
+          //   4. Sort survivors left-to-right by X so column order is always correct.
+          //   5. Take the 5 leftmost (or all if < 5 found).
 
-            // Sub-columns
+          const tallCandidates = allBoundingBoxes
+            .filter(b => b.w < cCols * 0.7)        // drop full-width page frame
+            .filter(b => b.h > cRows * 0.3);        // only genuinely tall regions
+
+          // Reference height = tallest surviving candidate
+          const refHeight = tallCandidates.length > 0
+            ? Math.max(...tallCandidates.map(b => b.h))
+            : 0;
+
+          const heightTolerance = Math.min(60, Math.round(refHeight * 0.10)); // ±10%, max 60px
+
+          const step5Candidates = tallCandidates
+            .filter(b => Math.abs(b.h - refHeight) <= heightTolerance) // same-height band
+            .sort((a, b) => a.x - b.x)             // left → right order
+            .slice(0, 5);                           // take at most 5
+
+          console.log(`[OMR] 📌 Step 5 — refH=${refHeight}px, tolerance=±${heightTolerance}px, found ${step5Candidates.length} column(s):`);
+          step5Candidates.forEach((box, i) => {
+            console.log(`[OMR]   Col ${i + 1}: W=${box.w} H=${box.h} @ (${box.x}, ${box.y})`);
+            const pt1 = OpenCV.createObject(ObjectType.Point, box.x, box.y);
+            const pt2 = OpenCV.createObject(ObjectType.Point, box.x + box.w, box.y + box.h);
+            OpenCV.invoke('rectangle', scoredMat, pt1, pt2, OpenCV.createObject(ObjectType.Scalar, 255, 0, 0, 255), 3, LineTypes.LINE_8);
+          });
+
+          // --- Step 6: Sub-Column Detection ---
+          // Driven exclusively by step5Candidates (the top-5 heights from Step 5).
+          // For each of those 5 columns we split into:
+          //   - 1 question-number sub-column (cyan)
+          //   - 4 option sub-columns A/B/C/D (green)
+          for (let c = 0; c < step5Candidates.length; c++) {
+            const col       = step5Candidates[c];
+            const startX    = col.x;
+            const colWidth  = col.w;
+            const colStartY = col.y;
+            const colHeight = col.h;
+
+            // Question-number sub-column (cyan)
             const qPt1 = OpenCV.createObject(ObjectType.Point, startX, colStartY);
             const qPt2 = OpenCV.createObject(ObjectType.Point, startX + qWidth, colStartY + colHeight);
             OpenCV.invoke('rectangle', subColsMat, qPt1, qPt2, OpenCV.createObject(ObjectType.Scalar, 0, 255, 255, 255), 2, LineTypes.LINE_8);
 
+            // 4 option sub-columns A/B/C/D (green)
             const singleOptionWidth = (colWidth - optionsStartOffset) / 4;
             for (let opt = 0; opt < 4; opt++) {
-              const oX = startX + optionsStartOffset + (opt * singleOptionWidth);
+              const oX   = startX + optionsStartOffset + (opt * singleOptionWidth);
               const oPt1 = OpenCV.createObject(ObjectType.Point, oX, colStartY);
               const oPt2 = OpenCV.createObject(ObjectType.Point, oX + singleOptionWidth, colStartY + colHeight);
               OpenCV.invoke('rectangle', subColsMat, oPt1, oPt2, OpenCV.createObject(ObjectType.Scalar, 0, 255, 0, 255), 2, LineTypes.LINE_8);
