@@ -461,44 +461,170 @@ export class OMRProcessor {
             }
           }
 
-          // Rows (Step 7)
-          const numRows = 20;
-          const rowHeight = cRows / numRows;
-          for (let r = 0; r <= numRows; r++) {
-            const y = r * rowHeight;
-            OpenCV.invoke('line', rowsMat, OpenCV.createObject(ObjectType.Point, 0, y), OpenCV.createObject(ObjectType.Point, cCols, y), OpenCV.createObject(ObjectType.Scalar, 255, 165, 0, 255), 2, LineTypes.LINE_8);
+          // ---------------------------------------------------------------
+          // Step 6.5: DYNAMIC ROW DETECTION
+          // Instead of assuming 20 rows, we find every bubble-sized contour
+          // inside each Step 5 column, cluster their Y-centers, and derive
+          // the actual row count and precise row boundaries.
+          // ---------------------------------------------------------------
+
+          type DetectedRow = { centerY: number; topY: number; bottomY: number; height: number };
+          const columnRowMaps: DetectedRow[][] = [];
+
+          for (let c = 0; c < step5Candidates.length; c++) {
+            const col = step5Candidates[c];
+
+            // Find bubble-sized contours whose CENTER falls inside this column
+            const bubblesInCol = allBoundingBoxes.filter(b =>
+              b.w >= 8 && b.w <= 100 && b.h >= 8 && b.h <= 50 &&
+              (b.x + b.w / 2) >= col.x && (b.x + b.w / 2) <= (col.x + col.w) &&
+              (b.y + b.h / 2) >= col.y && (b.y + b.h / 2) <= (col.y + col.h)
+            );
+
+            // Collect Y-centers sorted ascending
+            const yCenters = bubblesInCol.map(b => b.y + b.h / 2).sort((a, b) => a - b);
+
+            // Cluster nearby Y-centers (tolerance 12px)
+            const yTolerance = 12;
+            const yClusters: number[][] = [];
+            for (const yc of yCenters) {
+              let added = false;
+              for (const cluster of yClusters) {
+                const mean = cluster.reduce((s, v) => s + v, 0) / cluster.length;
+                if (Math.abs(yc - mean) <= yTolerance) {
+                  cluster.push(yc);
+                  added = true;
+                  break;
+                }
+              }
+              if (!added) yClusters.push([yc]);
+            }
+
+            // A valid row needs at least 2 bubbles (e.g. 2 of A/B/C/D detected)
+            const validClusters = yClusters
+              .filter(cl => cl.length >= 2)
+              .sort((a, b) => {
+                const meanA = a.reduce((s, v) => s + v, 0) / a.length;
+                const meanB = b.reduce((s, v) => s + v, 0) / b.length;
+                return meanA - meanB;
+              });
+
+            // Compute row center Y from each cluster's mean
+            const rowCenters = validClusters.map(cluster =>
+              cluster.reduce((s, v) => s + v, 0) / cluster.length
+            );
+
+            // Build row boundaries (midpoint between consecutive centers)
+            const rows: DetectedRow[] = [];
+            for (let i = 0; i < rowCenters.length; i++) {
+              const center = rowCenters[i];
+              const top = i === 0
+                ? col.y
+                : (rowCenters[i - 1] + center) / 2;
+              const bottom = i === rowCenters.length - 1
+                ? col.y + col.h
+                : (center + rowCenters[i + 1]) / 2;
+              rows.push({ centerY: center, topY: top, bottomY: bottom, height: bottom - top });
+            }
+
+            columnRowMaps.push(rows);
+            console.log(`[OMR] 📏 Col ${c + 1}: Detected ${rows.length} rows dynamically (${bubblesInCol.length} bubbles found).`);
           }
 
-          // Scoring (Step 8)
-          const cellPadding = 2;
-          for (let c = 0; c < numCols; c++) {
-            let startX, colWidth, colStartY, colHeight;
-            if (answerColumns.length === numCols) {
-              startX = answerColumns[c].x; colWidth = answerColumns[c].w; colStartY = answerColumns[c].y; colHeight = answerColumns[c].h;
-            } else {
-              const mathColWidth = (cCols - 58) / 5; startX = 21 + (c * (mathColWidth + 15)); colWidth = mathColWidth; colStartY = 0; colHeight = cRows;
-            }
-            const rH = colHeight / numRows;
-            const singleOptionWidth = (colWidth - optionsStartOffset) / 4;
+          // Consensus row count (for logging)
+          let consensusNumRows = 20;
+          if (columnRowMaps.length > 0) {
+            const counts = columnRowMaps.map(r => r.length);
+            const countFreq: Record<number, number> = {};
+            for (const cnt of counts) countFreq[cnt] = (countFreq[cnt] || 0) + 1;
+            consensusNumRows = parseInt(Object.entries(countFreq).sort((a, b) => b[1] - a[1])[0][0]) || 20;
+            console.log(`[OMR] 📊 Consensus row count: ${consensusNumRows} (from ${step5Candidates.length} columns)`);
+          }
 
-            for (let r = 0; r < numRows; r++) {
-              const rowY = colStartY + (r * rH);
+          // ---------------------------------------------------------------
+          // Step 7: Draw detected row boundaries per column (orange lines)
+          // ---------------------------------------------------------------
+          for (let c = 0; c < step5Candidates.length; c++) {
+            const col = step5Candidates[c];
+            const rows = columnRowMaps[c] || [];
+
+            if (rows.length > 0) {
+              // Draw orange line at each row's top boundary
+              for (const row of rows) {
+                const yTop = Math.round(row.topY);
+                OpenCV.invoke('line', rowsMat,
+                  OpenCV.createObject(ObjectType.Point, col.x, yTop),
+                  OpenCV.createObject(ObjectType.Point, col.x + col.w, yTop),
+                  OpenCV.createObject(ObjectType.Scalar, 255, 165, 0, 255), 2, LineTypes.LINE_8);
+              }
+              // Draw the final bottom boundary
+              const lastRow = rows[rows.length - 1];
+              OpenCV.invoke('line', rowsMat,
+                OpenCV.createObject(ObjectType.Point, col.x, Math.round(lastRow.bottomY)),
+                OpenCV.createObject(ObjectType.Point, col.x + col.w, Math.round(lastRow.bottomY)),
+                OpenCV.createObject(ObjectType.Scalar, 255, 165, 0, 255), 2, LineTypes.LINE_8);
+            } else {
+              // Fallback: uniform 20-row grid for this column
+              const fallbackRows = 20;
+              const rH = col.h / fallbackRows;
+              for (let r = 0; r <= fallbackRows; r++) {
+                const y = col.y + r * rH;
+                OpenCV.invoke('line', rowsMat,
+                  OpenCV.createObject(ObjectType.Point, col.x, y),
+                  OpenCV.createObject(ObjectType.Point, col.x + col.w, y),
+                  OpenCV.createObject(ObjectType.Scalar, 255, 165, 0, 255), 2, LineTypes.LINE_8);
+              }
+            }
+          }
+
+          // ---------------------------------------------------------------
+          // Step 8: Scoring — uses dynamically detected rows per column
+          // ---------------------------------------------------------------
+          const cellPadding = 2;
+          for (let c = 0; c < step5Candidates.length; c++) {
+            const col = step5Candidates[c];
+            const rows = columnRowMaps[c] || [];
+            const singleOptionWidth = (col.w - optionsStartOffset) / 4;
+
+            // Build row slices: detected rows or fallback uniform grid
+            const rowSlices: { y: number; h: number }[] = [];
+            if (rows.length > 0) {
+              for (const row of rows) {
+                rowSlices.push({ y: row.topY, h: row.height });
+              }
+            } else {
+              const fallbackRows = 20;
+              const rH = col.h / fallbackRows;
+              for (let r = 0; r < fallbackRows; r++) {
+                rowSlices.push({ y: col.y + r * rH, h: rH });
+              }
+            }
+
+            for (let r = 0; r < rowSlices.length; r++) {
+              const rowY = rowSlices[r].y;
+              const rH = rowSlices[r].h;
               let bestOpt = -1; let bestScore = -1;
+
               for (let opt = 0; opt < 4; opt++) {
-                const bubbleX = startX + optionsStartOffset + (opt * singleOptionWidth);
+                const bubbleX = col.x + optionsStartOffset + (opt * singleOptionWidth);
                 let sX = Math.max(0, Math.round(bubbleX + cellPadding));
                 let sY = Math.max(0, Math.round(rowY + cellPadding));
                 let sW = Math.min(cCols - sX, Math.round(singleOptionWidth - 2 * cellPadding));
                 let sH = Math.min(cRows - sY, Math.round(rH - 2 * cellPadding));
                 if (sW <= 0 || sH <= 0) continue;
+
                 const cellMat = OpenCV.createObject(ObjectType.Mat, 0, 0, DataTypes.CV_8U);
                 OpenCV.invoke('crop', croppedMat, cellMat, OpenCV.createObject(ObjectType.Rect, sX, sY, sW, sH));
                 const count = (OpenCV.invoke('countNonZero', cellMat) as any).value;
                 if (count > bestScore) { bestScore = count; bestOpt = opt; }
               }
+
               if (bestScore > 20 && bestOpt !== -1) {
-                const winX = startX + optionsStartOffset + (bestOpt * singleOptionWidth);
-                OpenCV.invoke('rectangle', finalScoredMat, OpenCV.createObject(ObjectType.Point, winX, rowY), OpenCV.createObject(ObjectType.Point, winX + singleOptionWidth, rowY + rH), OpenCV.createObject(ObjectType.Scalar, 0, 0, 255, 255), 3, LineTypes.LINE_8);
+                const winX = col.x + optionsStartOffset + (bestOpt * singleOptionWidth);
+                OpenCV.invoke('rectangle', finalScoredMat,
+                  OpenCV.createObject(ObjectType.Point, winX, rowY),
+                  OpenCV.createObject(ObjectType.Point, winX + singleOptionWidth, rowY + rH),
+                  OpenCV.createObject(ObjectType.Scalar, 0, 0, 255, 255), 3, LineTypes.LINE_8);
               }
             }
           }
